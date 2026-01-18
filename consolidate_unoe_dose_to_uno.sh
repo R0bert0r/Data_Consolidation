@@ -102,7 +102,7 @@ run_rsync() {
   rsync_common_flags
   rsync_excludes
   if [[ -n "${extra_flags}" ]]; then
-    extra=(${extra_flags})
+    read -r -a extra <<< "${extra_flags}"
   fi
   cmd=(rsync "${RSYNC_COMMON_FLAGS[@]}" "${RSYNC_EXCLUDES[@]}")
   if [[ "${DRY_RUN}" == "true" ]]; then
@@ -123,7 +123,7 @@ verify_rsync_dryrun() {
   rsync_common_flags
   rsync_excludes
   if [[ -n "${extra_flags}" ]]; then
-    extra=(${extra_flags})
+    read -r -a extra <<< "${extra_flags}"
   fi
   cmd=(rsync "${RSYNC_COMMON_FLAGS[@]}" "${RSYNC_EXCLUDES[@]}" --dry-run)
   cmd+=("${extra[@]}" "${src}" "${dest}")
