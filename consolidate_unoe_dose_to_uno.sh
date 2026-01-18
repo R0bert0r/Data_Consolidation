@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Consolidate UNOE and DOSE into UNO with taxonomy mapping, conflict handling,
-# provenance tracking, verification, and dedupe.
-
 SCRIPT_NAME="$(basename "$0")"
 
 UNOE_ROOT="/srv/dev-disk-by-uuid-9E0E3E860E3E580B"
@@ -79,6 +76,26 @@ log_status() {
   echo "[${SCRIPT_NAME}] ${1} (logs: ${LOGDIR})"
 }
 
+is_excluded_dir_name() {
+  local name="${1}"
+  if [[ "${name}" == "\$RECYCLE.BIN" || "${name}" == "System Volume Information" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+find_files_pruned() {
+  local root="${1}"
+  find "${root}" \
+    \( -type d \( -name '$RECYCLE.BIN' -o -name 'System Volume Information' \) -prune \) \
+    -o -type f -print0
+}
+
+find_top_level_files() {
+  local root="${1}"
+  find "${root}" -mindepth 1 -maxdepth 1 -type f -print0
+}
+
 rsync_excludes() {
   RSYNC_EXCLUDES=(
     "--exclude=\$RECYCLE.BIN/"
@@ -99,16 +116,20 @@ run_rsync() {
   local log_file="${4}"
   local -a cmd
   local -a extra=()
+
   rsync_common_flags
   rsync_excludes
+
   if [[ -n "${extra_flags}" ]]; then
     read -r -a extra <<< "${extra_flags}"
   fi
+
   cmd=(rsync "${RSYNC_COMMON_FLAGS[@]}" "${RSYNC_EXCLUDES[@]}")
   if [[ "${DRY_RUN}" == "true" ]]; then
     cmd+=(--dry-run)
   fi
   cmd+=("${extra[@]}" "${src}" "${dest}")
+
   CURRENT_ACTION="rsync ${src} -> ${dest}"
   "${cmd[@]}" 2>&1 | tee -a "${log_file}"
 }
@@ -120,13 +141,17 @@ verify_rsync_dryrun() {
   local log_file="${4}"
   local -a cmd
   local -a extra=()
+
   rsync_common_flags
   rsync_excludes
+
   if [[ -n "${extra_flags}" ]]; then
     read -r -a extra <<< "${extra_flags}"
   fi
+
   cmd=(rsync "${RSYNC_COMMON_FLAGS[@]}" "${RSYNC_EXCLUDES[@]}" --dry-run)
   cmd+=("${extra[@]}" "${src}" "${dest}")
+
   CURRENT_ACTION="verify rsync dry-run ${src} -> ${dest}"
   "${cmd[@]}" 2>&1 | tee "${log_file}"
 }
@@ -165,7 +190,9 @@ prepare_dest() {
   mkdir -p "${UNO_ROOT}/90_System_Artifacts/Recovery/found.000"
   mkdir -p "${UNO_ROOT}/02_Media/Photos/_From_Root/UNOE"
   mkdir -p "${UNO_ROOT}/02_Media/Photos/_From_Root/DOSE"
-  normalize_permissions
+  if [[ "${DRY_RUN}" == "false" ]]; then
+    normalize_permissions
+  fi
 }
 
 is_image_file() {
@@ -174,26 +201,6 @@ is_image_file() {
     *.jpg|*.jpeg|*.png|*.gif|*.tiff|*.tif|*.bmp|*.heic) return 0 ;;
     *) return 1 ;;
   esac
-}
-
-is_excluded_name() {
-  local name="${1}"
-  if [[ "${name}" == "\$RECYCLE.BIN" || "${name}" == "System Volume Information" ]]; then
-    return 0
-  fi
-  return 1
-}
-
-find_files_pruned() {
-  local root="${1}"
-  find "${root}" \
-    \( -type d \( -name '$RECYCLE.BIN' -o -name 'System Volume Information' \) -prune \) \
-    -o -type f -print0
-}
-
-find_top_level_files() {
-  local root="${1}"
-  find "${root}" -mindepth 1 -maxdepth 1 -type f -print0
 }
 
 build_mapping() {
@@ -271,7 +278,7 @@ copy_mapped_and_unmapped() {
     local name
     name="$(basename "${entry}")"
 
-    if is_excluded_name "${name}"; then
+    if is_excluded_dir_name "${name}"; then
       continue
     fi
 
@@ -311,7 +318,7 @@ copy_loose_files() {
   while IFS= read -r -d '' file; do
     local base
     base="$(basename "${file}")"
-    if is_excluded_name "${base}"; then
+    if is_excluded_dir_name "${base}"; then
       continue
     fi
     if is_image_file "${base}"; then
@@ -321,7 +328,7 @@ copy_loose_files() {
       run_rsync "${file}" "${UNO_ROOT}/90_System_Artifacts/Loose_Files/${origin}/${base}" "${extra_flags}" "${log_file}"
       verify_rsync_dryrun "${file}" "${UNO_ROOT}/90_System_Artifacts/Loose_Files/${origin}/${base}" "${extra_flags}" "${LOGDIR}/${verify_prefix}_verify_dryrun_loose_files_${origin}.txt"
     fi
-  done < <(find "${src_root}" -mindepth 1 -maxdepth 1 -type f -print0)
+  done < <(find_top_level_files "${src_root}")
 }
 
 copy_unoe() {
@@ -421,7 +428,7 @@ init_provenance() {
   fi
 }
 
-update_provenance() {
+append_provenance() {
   local dest_rel="${1}"
   local origin="${2}"
   local src_path="${3}"
@@ -431,11 +438,17 @@ update_provenance() {
   local size="${7}"
   local sha="${8}"
 
-  local tmp
-  tmp="${provenance_file}.tmp"
-  awk -F, -v dest="${dest_rel}" 'NR==1{print;next} $1!=dest {print}' "${provenance_file}" > "${tmp}"
-  echo "${dest_rel},${origin},${src_path},${create_time},${create_status},${src_mtime},${size},${sha}" >> "${tmp}"
-  mv "${tmp}" "${provenance_file}"
+  python3 - "${provenance_file}" "${dest_rel}" "${origin}" "${src_path}" "${create_time}" "${create_status}" "${src_mtime}" "${size}" "${sha}" <<'PY'
+import csv
+import sys
+
+output = sys.argv[1]
+row = sys.argv[2:]
+
+with open(output, 'a', newline='') as handle:
+    writer = csv.writer(handle)
+    writer.writerow(row)
+PY
 }
 
 record_provenance_for_bucket() {
@@ -468,48 +481,9 @@ record_provenance_for_bucket() {
       create_info="$(get_create_time "${file}")"
       local create_time="${create_info%%|*}"
       local create_status="${create_info##*|}"
-      update_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${sha}"
+      append_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${sha}"
     fi
   done < <(find_files_pruned "${src_root}")
-}
-
-record_provenance_all() {
-  init_provenance
-  record_provenance_for_bucket "${UNOE_ROOT}/ASH" "${UNO_ROOT}/ASH" "UNOE"
-  record_provenance_for_bucket "${UNOE_ROOT}/Backups" "${UNO_ROOT}/Backups" "UNOE"
-  record_provenance_for_bucket "${UNOE_ROOT}/Dropbox" "${UNO_ROOT}/Dropbox" "UNOE"
-  record_provenance_for_bucket "${DOSE_ROOT}/ASH" "${UNO_ROOT}/ASH" "DOSE"
-  record_provenance_for_bucket "${DOSE_ROOT}/Backups" "${UNO_ROOT}/Backups" "DOSE"
-  record_provenance_for_bucket "${DOSE_ROOT}/Dropbox" "${UNO_ROOT}/Dropbox" "DOSE"
-
-  for key in "${!MAP[@]}"; do
-    record_provenance_for_bucket "${UNOE_ROOT}/${key}" "${UNO_ROOT}/${MAP[${key}]}" "UNOE"
-    record_provenance_for_bucket "${DOSE_ROOT}/${key}" "${UNO_ROOT}/${MAP[${key}]}" "DOSE"
-  done
-
-  while IFS= read -r -d '' entry; do
-    local name
-    name="$(basename "${entry}")"
-    if is_excluded_name "${name}"; then
-      continue
-    fi
-    if [[ -z "${MAP[${name}]:-}" && "${name}" != "ASH" && "${name}" != "Backups" && "${name}" != "Dropbox" && "${name}" != "found.000" ]]; then
-      record_provenance_for_bucket "${entry}" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/UNOE/${name}" "UNOE"
-    fi
-  done < <(find "${UNOE_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0)
-
-  while IFS= read -r -d '' entry; do
-    local name
-    name="$(basename "${entry}")"
-    if is_excluded_name "${name}"; then
-      continue
-    fi
-    if [[ -z "${MAP[${name}]:-}" && "${name}" != "ASH" && "${name}" != "Backups" && "${name}" != "Dropbox" && "${name}" != "found.000" ]]; then
-      record_provenance_for_bucket "${entry}" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/DOSE/${name}" "DOSE"
-    fi
-  done < <(find "${DOSE_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0)
-  record_provenance_loose_files "${UNOE_ROOT}" "UNOE"
-  record_provenance_loose_files "${DOSE_ROOT}" "DOSE"
 }
 
 record_provenance_loose_files() {
@@ -519,7 +493,7 @@ record_provenance_loose_files() {
   while IFS= read -r -d '' file; do
     local base
     base="$(basename "${file}")"
-    if is_excluded_name "${base}"; then
+    if is_excluded_dir_name "${base}"; then
       continue
     fi
     local dest_path
@@ -544,9 +518,49 @@ record_provenance_loose_files() {
       create_info="$(get_create_time "${file}")"
       local create_time="${create_info%%|*}"
       local create_status="${create_info##*|}"
-      update_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${dest_sha}"
+      append_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${dest_sha}"
     fi
   done < <(find_top_level_files "${src_root}")
+}
+
+record_provenance_all() {
+  init_provenance
+  record_provenance_for_bucket "${UNOE_ROOT}/ASH" "${UNO_ROOT}/ASH" "UNOE"
+  record_provenance_for_bucket "${UNOE_ROOT}/Backups" "${UNO_ROOT}/Backups" "UNOE"
+  record_provenance_for_bucket "${UNOE_ROOT}/Dropbox" "${UNO_ROOT}/Dropbox" "UNOE"
+  record_provenance_for_bucket "${DOSE_ROOT}/ASH" "${UNO_ROOT}/ASH" "DOSE"
+  record_provenance_for_bucket "${DOSE_ROOT}/Backups" "${UNO_ROOT}/Backups" "DOSE"
+  record_provenance_for_bucket "${DOSE_ROOT}/Dropbox" "${UNO_ROOT}/Dropbox" "DOSE"
+
+  for key in "${!MAP[@]}"; do
+    record_provenance_for_bucket "${UNOE_ROOT}/${key}" "${UNO_ROOT}/${MAP[${key}]}" "UNOE"
+    record_provenance_for_bucket "${DOSE_ROOT}/${key}" "${UNO_ROOT}/${MAP[${key}]}" "DOSE"
+  done
+
+  while IFS= read -r -d '' entry; do
+    local name
+    name="$(basename "${entry}")"
+    if is_excluded_dir_name "${name}"; then
+      continue
+    fi
+    if [[ -z "${MAP[${name}]:-}" && "${name}" != "ASH" && "${name}" != "Backups" && "${name}" != "Dropbox" && "${name}" != "found.000" ]]; then
+      record_provenance_for_bucket "${entry}" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/UNOE/${name}" "UNOE"
+    fi
+  done < <(find "${UNOE_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0)
+
+  while IFS= read -r -d '' entry; do
+    local name
+    name="$(basename "${entry}")"
+    if is_excluded_dir_name "${name}"; then
+      continue
+    fi
+    if [[ -z "${MAP[${name}]:-}" && "${name}" != "ASH" && "${name}" != "Backups" && "${name}" != "Dropbox" && "${name}" != "found.000" ]]; then
+      record_provenance_for_bucket "${entry}" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/DOSE/${name}" "DOSE"
+    fi
+  done < <(find "${DOSE_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0)
+
+  record_provenance_loose_files "${UNOE_ROOT}" "UNOE"
+  record_provenance_loose_files "${DOSE_ROOT}" "DOSE"
 }
 
 collision_log_candidates=""
@@ -664,21 +678,9 @@ resolve_one_collision() {
 
   if [[ "${newest_size}" -gt "${other_size}" ]]; then
     action="replace_with_newest"
-    if [[ -f "${dest_file}" ]]; then
-      local dest_sha
-      dest_sha="$(sha256_file "${dest_file}")"
-      local newest_sha
-      newest_sha="$(sha256_file "${newest_file}")"
-      if [[ "${dest_sha}" != "${newest_sha}" ]]; then
-        if [[ "${DRY_RUN}" == "false" ]]; then
-          rm -f "${dest_file}"
-          rsync -a --itemize-changes --stats --chown=tom:sambashare "${newest_file}" "${dest_file}" >> "${collision_log_actions}"
-        fi
-      fi
-    else
-      if [[ "${DRY_RUN}" == "false" ]]; then
-        rsync -a --itemize-changes --stats --chown=tom:sambashare "${newest_file}" "${dest_file}" >> "${collision_log_actions}"
-      fi
+    if [[ "${DRY_RUN}" == "false" ]]; then
+      rm -f "${dest_file}"
+      rsync -a --itemize-changes --stats --chown=tom:sambashare "${newest_file}" "${dest_file}" >> "${collision_log_actions}"
     fi
     resulting_paths="${dest_file}"
   else
@@ -723,7 +725,7 @@ resolve_one_collision() {
       mtime="$(mtime_utc "${unoe_file}")"
       size="${unoe_size}"
       sha="${unoe_sha}"
-      update_provenance "${dest_rel}" "UNOE" "${unoe_file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${sha}"
+      append_provenance "${dest_rel}" "UNOE" "${unoe_file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${sha}"
     else
       create_info="$(get_create_time "${dose_file}")"
       create_time="${create_info%%|*}"
@@ -731,7 +733,7 @@ resolve_one_collision() {
       mtime="$(mtime_utc "${dose_file}")"
       size="${dose_size}"
       sha="${dose_sha}"
-      update_provenance "${dest_rel}" "DOSE" "${dose_file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${sha}"
+      append_provenance "${dest_rel}" "DOSE" "${dose_file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${sha}"
     fi
     if [[ "${action}" == "keep_both" ]]; then
       local suffixed_rel
@@ -744,7 +746,7 @@ resolve_one_collision() {
       other_mtime="$(mtime_utc "${other_file}")"
       local other_sha
       other_sha="$(sha256_file "${other_file}")"
-      update_provenance "${suffixed_rel}" "${other_suffix}" "${other_file}" "${other_time}" "${other_status}" "${other_mtime}" "${other_size}" "${other_sha}"
+      append_provenance "${suffixed_rel}" "${other_suffix}" "${other_file}" "${other_time}" "${other_status}" "${other_mtime}" "${other_size}" "${other_sha}"
     fi
   fi
 }
@@ -925,6 +927,7 @@ PY
 import csv
 import os
 import sys
+import hashlib
 
 sample_list = sys.argv[1]
 output_csv = sys.argv[2]
@@ -950,7 +953,6 @@ try:
                         continue
                     rel_path = path[len(uno_root) + 1:] if path.startswith(uno_root + os.sep) else path
                     try:
-                        import hashlib
                         sha256 = hashlib.sha256()
                         with open(path, 'rb') as data_handle:
                             for chunk in iter(lambda: data_handle.read(1024 * 1024), b''):
@@ -987,8 +989,8 @@ dedupe_hardlinks() {
     "${UNO_ROOT}/Research"
   )
 
-  jdupes -r -L -Q "${dedupe_dirs[@]}" | tee "${LOGDIR}/60_dedupe_report.txt"
-  jdupes -r -L -Q -v "${dedupe_dirs[@]}" > "${LOGDIR}/61_dedupe_actions.txt"
+  jdupes -r -L "${dedupe_dirs[@]}" | tee "${LOGDIR}/60_dedupe_report.txt"
+  jdupes -r -L -v "${dedupe_dirs[@]}" > "${LOGDIR}/61_dedupe_actions.txt"
   jdupes -r -S "${dedupe_dirs[@]}" > "${LOGDIR}/62_dedupe_space_savings.txt"
 }
 
