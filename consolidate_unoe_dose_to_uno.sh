@@ -80,7 +80,7 @@ log_status() {
 }
 
 rsync_excludes() {
-  echo "--exclude=$RECYCLE.BIN/ --exclude=System Volume Information/"
+  echo "--exclude=\\$RECYCLE.BIN/ --exclude=System\\ Volume\\ Information/"
 }
 
 rsync_common_flags() {
@@ -436,7 +436,7 @@ record_provenance_for_bucket() {
       local create_status="${create_info##*|}"
       update_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${sha}"
     fi
-  done < <(find "${src_root}" -type f -not -path "*/$RECYCLE.BIN/*" -not -path "*/System Volume Information/*" -print0)
+  done < <(find "${src_root}" -type f -not -path '*/$RECYCLE.BIN/*' -not -path '*/System Volume Information/*' -print0)
 }
 
 record_provenance_all() {
@@ -512,7 +512,7 @@ record_provenance_loose_files() {
       local create_status="${create_info##*|}"
       update_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${dest_sha}"
     fi
-  done < <(find "${src_root}" -mindepth 1 -maxdepth 1 -type f -not -path "*/$RECYCLE.BIN/*" -not -path "*/System Volume Information/*" -print0)
+  done < <(find "${src_root}" -mindepth 1 -maxdepth 1 -type f -not -path '*/$RECYCLE.BIN/*' -not -path '*/System Volume Information/*' -print0)
 }
 
 collision_log_candidates=""
@@ -732,7 +732,7 @@ resolve_conflicts_in_bucket() {
       local dest_file="${dest_base}/${rel}"
       resolve_one_collision "${unoe_file}" "${dose_file}" "${dest_file}"
     fi
-  done < <(find "${dose_base}" -type f -not -path "*/$RECYCLE.BIN/*" -not -path "*/System Volume Information/*" -print0)
+  done < <(find "${dose_base}" -type f -not -path '*/$RECYCLE.BIN/*' -not -path '*/System Volume Information/*' -print0)
 }
 
 resolve_conflicts() {
@@ -793,7 +793,7 @@ compute_hash_sample() {
   for bucket in "${buckets[@]}"; do
     if [[ -d "${bucket}" ]]; then
       find "${bucket}" -type f -printf '%s\t%p\n' | sort -nr | head -n 50 | awk '{print $2}' >> "${hash_sample_file}"
-      python3 - <<'PY'
+      python3 - "${seed}" "${bucket}" >> "${hash_sample_file}" <<'PY'
 import os, random, sys
 seed = sys.argv[1]
 path = sys.argv[2]
@@ -807,7 +807,6 @@ if files:
     for item in sample:
         print(item)
 PY
-"${seed}" "${bucket}" >> "${hash_sample_file}"
     fi
   done
 
