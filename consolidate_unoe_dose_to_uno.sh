@@ -826,30 +826,65 @@ compute_hash_sample() {
 
   for bucket in "${buckets[@]}"; do
     if [[ -d "${bucket}" ]]; then
-      find "${bucket}" -type f -printf '%s\t%p\n' | sort -nr | head -n 50 | awk '{print $2}' >> "${hash_sample_file}"
       python3 - "${seed}" "${bucket}" >> "${hash_sample_file}" <<'PY'
-import os, random, sys
+import os
+import random
+import sys
+
 seed = sys.argv[1]
-path = sys.argv[2]
-random.seed(seed)
+bucket = sys.argv[2]
+random.seed(f"{seed}|{bucket}")
+
 files = []
-for root, _, names in os.walk(path):
-    for name in names:
-        files.append(os.path.join(root, name))
+for root, dirnames, filenames in os.walk(bucket):
+    dirnames[:] = [d for d in dirnames if d not in ('$RECYCLE.BIN', 'System Volume Information')]
+    for name in filenames:
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            files.append((size, path))
+
 if files:
-    sample = files if len(files) <= 200 else random.sample(files, 200)
-    for item in sample:
-        print(item)
+    files.sort(key=lambda item: item[0], reverse=True)
+    for _, path in files[:50]:
+        print(path)
+    paths = [path for _, path in files]
+    if len(paths) <= 200:
+        sample = paths
+    else:
+        sample = random.sample(paths, 200)
+    for path in sample:
+        print(path)
 PY
     fi
   done
 
   if [[ -f "${collision_log_resolution}" ]]; then
-    awk -F, 'NR>1 {print $1}' "${collision_log_resolution}" | while read -r rel; do
-      if [[ -n "${rel}" ]]; then
-        echo "${UNO_ROOT}/${rel}" >> "${hash_sample_file}"
-      fi
-    done
+    python3 - "${UNO_ROOT}" "${collision_log_resolution}" >> "${hash_sample_file}" <<'PY'
+import csv
+import os
+import sys
+
+uno_root = sys.argv[1]
+csv_path = sys.argv[2]
+
+with open(csv_path, newline='') as handle:
+    reader = csv.reader(handle)
+    next(reader, None)
+    for row in reader:
+        if not row:
+            continue
+        path = row[0]
+        if not path:
+            continue
+        if path.startswith('/'):
+            print(path)
+        else:
+            print(os.path.join(uno_root, path))
+PY
   fi
 
   sort -u "${hash_sample_file}" | grep -v '^$' > "${hash_sample_file}.tmp"
@@ -918,16 +953,20 @@ missing = sys.argv[3]
 sha_to_times = defaultdict(list)
 sha_to_paths = defaultdict(list)
 
+all_paths = []
+
 with open(provenance, newline='') as f:
     reader = csv.DictReader(f)
     for row in reader:
-        sha = row['sha256']
-        ctime = row['src_create_time_utc']
-        status = row['create_time_status']
-        dest = row['dest_path']
+        sha = row.get('sha256', '')
+        ctime = row.get('src_create_time_utc', '')
+        status = row.get('create_time_status', '')
+        dest = row.get('dest_path', '')
+        if dest:
+            all_paths.append((dest, sha))
         if sha and dest:
             sha_to_paths[sha].append(dest)
-        if ctime and status == 'ok':
+        if sha and ctime and status == 'ok':
             sha_to_times[sha].append(ctime)
 
 with open(manifest, 'w', newline='') as f:
@@ -942,10 +981,11 @@ with open(manifest, 'w', newline='') as f:
 with open(missing, 'w', newline='') as f:
     writer = csv.writer(f)
     writer.writerow(['dest_path', 'sha256'])
-    for sha, paths in sha_to_paths.items():
-        if sha not in sha_to_times or not sha_to_times[sha]:
-            for path in paths:
-                writer.writerow([path, sha])
+    for path, sha in all_paths:
+        if not sha:
+            writer.writerow([path, sha])
+        elif sha not in sha_to_times or not sha_to_times[sha]:
+            writer.writerow([path, sha])
 PY
 
   cat <<EOWIN > "${instructions}"
