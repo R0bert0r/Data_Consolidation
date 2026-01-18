@@ -810,7 +810,6 @@ hash_sample_file=""
 
 compute_hash_sample() {
   local output_file="${1}"
-  local seed="${RUN_ID}"
   hash_sample_file="${LOGDIR}/43_verify_hash_sample_list.txt"
   : > "${hash_sample_file}"
 
@@ -824,44 +823,6 @@ compute_hash_sample() {
     "${UNO_ROOT}/Research"
   )
 
-  for bucket in "${buckets[@]}"; do
-    if [[ -d "${bucket}" ]]; then
-      python3 - "${seed}" "${bucket}" >> "${hash_sample_file}" <<'PY'
-import os
-import random
-import sys
-
-seed = sys.argv[1]
-bucket = sys.argv[2]
-random.seed(f"{seed}|{bucket}")
-
-files = []
-for root, dirnames, filenames in os.walk(bucket):
-    dirnames[:] = [d for d in dirnames if d not in ('$RECYCLE.BIN', 'System Volume Information')]
-    for name in filenames:
-        path = os.path.join(root, name)
-        if os.path.isfile(path):
-            try:
-                size = os.path.getsize(path)
-            except OSError:
-                continue
-            files.append((size, path))
-
-if files:
-    files.sort(key=lambda item: item[0], reverse=True)
-    for _, path in files[:50]:
-        print(path)
-    paths = [path for _, path in files]
-    if len(paths) <= 200:
-        sample = paths
-    else:
-        sample = random.sample(paths, 200)
-    for path in sample:
-        print(path)
-PY
-    fi
-  done
-
   if [[ -f "${collision_log_resolution}" ]]; then
     python3 - "${UNO_ROOT}" "${collision_log_resolution}" >> "${hash_sample_file}" <<'PY'
 import csv
@@ -871,34 +832,136 @@ import sys
 uno_root = sys.argv[1]
 csv_path = sys.argv[2]
 
-with open(csv_path, newline='') as handle:
-    reader = csv.reader(handle)
-    next(reader, None)
-    for row in reader:
-        if not row:
-            continue
-        path = row[0]
-        if not path:
-            continue
-        if path.startswith('/'):
-            print(path)
-        else:
-            print(os.path.join(uno_root, path))
+try:
+    with open(csv_path, newline='') as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
+        for row in reader:
+            if not row:
+                continue
+            path = row[0]
+            if not path:
+                continue
+            if path.startswith('/'):
+                print(path)
+            else:
+                print(os.path.join(uno_root, path))
+except OSError:
+    pass
 PY
   fi
 
-  sort -u "${hash_sample_file}" | grep -v '^$' > "${hash_sample_file}.tmp"
+  for bucket in "${buckets[@]}"; do
+    if [[ -d "${bucket}" ]]; then
+      python3 - "${RUN_ID}" "${bucket}" >> "${hash_sample_file}" <<'PY'
+import os
+import random
+import sys
+
+seed = sys.argv[1]
+bucket = sys.argv[2]
+
+rng = random.Random(f"{seed}|{bucket}")
+
+files = []
+try:
+    for root, dirnames, filenames in os.walk(bucket):
+        dirnames[:] = [d for d in dirnames if d not in ('$RECYCLE.BIN', 'System Volume Information')]
+        for name in filenames:
+            path = os.path.join(root, name)
+            try:
+                if os.path.isfile(path):
+                    size = os.path.getsize(path)
+                    files.append((size, path))
+            except OSError:
+                continue
+except OSError:
+    files = []
+
+if not files:
+    sys.exit(0)
+
+files.sort(key=lambda item: item[0], reverse=True)
+top_paths = [path for _, path in files[:50]]
+all_paths = [path for _, path in files]
+
+if len(all_paths) <= 200:
+    sample_paths = list(all_paths)
+else:
+    sample_paths = rng.sample(all_paths, 200)
+
+seen = set()
+for path in top_paths + sample_paths:
+    if path in seen:
+        continue
+    seen.add(path)
+    print(path)
+PY
+    fi
+  done
+
+  python3 - "${hash_sample_file}" <<'PY' > "${hash_sample_file}.tmp"
+import sys
+
+src = sys.argv[1]
+seen = set()
+
+try:
+    with open(src, 'r', encoding='utf-8', errors='replace') as handle:
+        for line in handle:
+            path = line.strip('\n')
+            if not path:
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            print(path)
+except OSError:
+    pass
+PY
   mv "${hash_sample_file}.tmp" "${hash_sample_file}"
 
-  echo "path,sha256,size_bytes" > "${output_file}"
-  while IFS= read -r file; do
-    if [[ -f "${file}" ]]; then
-      local sha size
-      sha="$(sha256_file "${file}")"
-      size="$(size_bytes "${file}")"
-      echo "${file#${UNO_ROOT}/},${sha},${size}" >> "${output_file}"
-    fi
-  done < "${hash_sample_file}"
+  python3 - "${hash_sample_file}" "${output_file}" "${UNO_ROOT}" <<'PY'
+import csv
+import os
+import sys
+
+sample_list = sys.argv[1]
+output_csv = sys.argv[2]
+uno_root = sys.argv[3]
+
+try:
+    with open(output_csv, 'w', newline='') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['path', 'sha256', 'size_bytes'])
+        try:
+            sample_handle = open(sample_list, 'r', encoding='utf-8', errors='replace')
+        except OSError:
+            sample_handle = None
+        if sample_handle:
+            with sample_handle:
+                for line in sample_handle:
+                    path = line.strip('\n')
+                    if not path or not os.path.isfile(path):
+                        continue
+                    try:
+                        size = os.path.getsize(path)
+                    except OSError:
+                        continue
+                    rel_path = path[len(uno_root) + 1:] if path.startswith(uno_root + os.sep) else path
+                    try:
+                        import hashlib
+                        sha256 = hashlib.sha256()
+                        with open(path, 'rb') as data_handle:
+                            for chunk in iter(lambda: data_handle.read(1024 * 1024), b''):
+                                sha256.update(chunk)
+                        digest = sha256.hexdigest()
+                    except OSError:
+                        continue
+                    writer.writerow([rel_path, digest, size])
+except OSError:
+    pass
+PY
 }
 
 verify_pre_dedupe() {
@@ -941,51 +1004,104 @@ compute_create_time_manifest() {
   local missing="${LOGDIR}/50_create_time_missing.csv"
   local instructions="${LOGDIR}/51_create_time_windows_apply_instructions.txt"
 
-  python3 - "${provenance_file}" "${manifest}" "${missing}" <<'PY'
+  python3 - "${provenance_file}" "${manifest}" "${missing}" "${UNO_ROOT}" <<'PY'
 import csv
+import os
 import sys
 from collections import defaultdict
 
 provenance = sys.argv[1]
 manifest = sys.argv[2]
 missing = sys.argv[3]
+uno_root = sys.argv[4]
 
-sha_to_times = defaultdict(list)
-sha_to_paths = defaultdict(list)
+inode_groups = defaultdict(list)
+sha_groups = defaultdict(list)
+create_times = defaultdict(list)
+all_entries = []
 
-all_paths = []
+def normalize_dest(path):
+    if not path:
+        return ""
+    if path.startswith('/'):
+        return path
+    return os.path.join(uno_root, path)
 
-with open(provenance, newline='') as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        sha = row.get('sha256', '')
-        ctime = row.get('src_create_time_utc', '')
-        status = row.get('create_time_status', '')
-        dest = row.get('dest_path', '')
-        if dest:
-            all_paths.append((dest, sha))
-        if sha and dest:
-            sha_to_paths[sha].append(dest)
-        if sha and ctime and status == 'ok':
-            sha_to_times[sha].append(ctime)
+def record_create_time(group_key, ctime):
+    if group_key and ctime:
+        create_times[group_key].append(ctime)
 
-with open(manifest, 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(['dest_path_relative_to_share', 'earliest_create_time_utc_iso8601'])
-    for sha, paths in sha_to_paths.items():
-        if sha in sha_to_times and sha_to_times[sha]:
-            earliest = sorted(sha_to_times[sha])[0]
-            for path in paths:
-                writer.writerow([path, earliest])
+try:
+    with open(provenance, newline='') as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            dest_rel = (row.get('dest_path') or '').strip()
+            sha = (row.get('sha256') or '').strip()
+            ctime = (row.get('src_create_time_utc') or '').strip()
+            status = (row.get('create_time_status') or '').strip()
+            dest_abs = normalize_dest(dest_rel)
+            all_entries.append((dest_rel, dest_abs, sha))
 
-with open(missing, 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(['dest_path', 'sha256'])
-    for path, sha in all_paths:
-        if not sha:
-            writer.writerow([path, sha])
-        elif sha not in sha_to_times or not sha_to_times[sha]:
-            writer.writerow([path, sha])
+            inode_key = ""
+            try:
+                if dest_abs and os.path.isfile(dest_abs):
+                    stat_info = os.stat(dest_abs)
+                    inode_key = f"inode:{stat_info.st_dev}:{stat_info.st_ino}"
+            except OSError:
+                inode_key = ""
+
+            if inode_key:
+                inode_groups[inode_key].append(dest_rel)
+                if status == 'ok' and ctime:
+                    record_create_time(inode_key, ctime)
+            elif sha:
+                sha_key = f"sha:{sha}"
+                sha_groups[sha_key].append(dest_rel)
+                if status == 'ok' and ctime:
+                    record_create_time(sha_key, ctime)
+except OSError:
+    pass
+
+manifest_paths = {}
+for group_key, paths in {**inode_groups, **sha_groups}.items():
+    times = create_times.get(group_key, [])
+    if not times:
+        continue
+    earliest = sorted(times)[0]
+    for path in paths:
+        manifest_paths[path] = earliest
+
+try:
+    with open(manifest, 'w', newline='') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['dest_path_relative_to_share', 'earliest_create_time_utc_iso8601'])
+        for path, earliest in manifest_paths.items():
+            writer.writerow([path, earliest])
+except OSError:
+    pass
+
+missing_rows = {}
+for dest_rel, dest_abs, sha in all_entries:
+    if not dest_rel:
+        continue
+    if dest_rel in manifest_paths:
+        continue
+    if not dest_abs or not os.path.isfile(dest_abs):
+        reason = "destination_missing"
+    elif not sha:
+        reason = "missing_identity_key"
+    else:
+        reason = "missing_creation_time"
+    missing_rows[(dest_rel, reason, sha)] = None
+
+try:
+    with open(missing, 'w', newline='') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['dest_path', 'reason', 'sha256'])
+        for dest_rel, reason, sha in missing_rows.keys():
+            writer.writerow([dest_rel, reason, sha])
+except OSError:
+    pass
 PY
 
   cat <<EOWIN > "${instructions}"
