@@ -80,11 +80,16 @@ log_status() {
 }
 
 rsync_excludes() {
-  echo "--exclude=\\$RECYCLE.BIN/ --exclude=System\\ Volume\\ Information/"
+  RSYNC_EXCLUDES=(
+    "--exclude=\$RECYCLE.BIN/"
+    "--exclude=\$RECYCLE.BIN/***"
+    "--exclude=System Volume Information/"
+    "--exclude=System Volume Information/***"
+  )
 }
 
 rsync_common_flags() {
-  echo "-a --itemize-changes --stats --chown=tom:sambashare"
+  RSYNC_COMMON_FLAGS=(-a --itemize-changes --stats --chown=tom:sambashare)
 }
 
 run_rsync() {
@@ -92,12 +97,20 @@ run_rsync() {
   local dest="${2}"
   local extra_flags="${3}"
   local log_file="${4}"
-  local dry_flag=""
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    dry_flag="--dry-run"
+  local -a cmd
+  local -a extra=()
+  rsync_common_flags
+  rsync_excludes
+  if [[ -n "${extra_flags}" ]]; then
+    extra=(${extra_flags})
   fi
+  cmd=(rsync "${RSYNC_COMMON_FLAGS[@]}" "${RSYNC_EXCLUDES[@]}")
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    cmd+=(--dry-run)
+  fi
+  cmd+=("${extra[@]}" "${src}" "${dest}")
   CURRENT_ACTION="rsync ${src} -> ${dest}"
-  rsync $(rsync_common_flags) $(rsync_excludes) ${dry_flag} ${extra_flags} "${src}" "${dest}" | tee -a "${log_file}"
+  "${cmd[@]}" 2>&1 | tee -a "${log_file}"
 }
 
 verify_rsync_dryrun() {
@@ -105,8 +118,17 @@ verify_rsync_dryrun() {
   local dest="${2}"
   local extra_flags="${3}"
   local log_file="${4}"
+  local -a cmd
+  local -a extra=()
+  rsync_common_flags
+  rsync_excludes
+  if [[ -n "${extra_flags}" ]]; then
+    extra=(${extra_flags})
+  fi
+  cmd=(rsync "${RSYNC_COMMON_FLAGS[@]}" "${RSYNC_EXCLUDES[@]}" --dry-run)
+  cmd+=("${extra[@]}" "${src}" "${dest}")
   CURRENT_ACTION="verify rsync dry-run ${src} -> ${dest}"
-  rsync $(rsync_common_flags) $(rsync_excludes) --dry-run ${extra_flags} "${src}" "${dest}" | tee "${log_file}"
+  "${cmd[@]}" 2>&1 | tee "${log_file}"
 }
 
 normalize_permissions() {
@@ -160,6 +182,18 @@ is_excluded_name() {
     return 0
   fi
   return 1
+}
+
+find_files_pruned() {
+  local root="${1}"
+  find "${root}" \
+    \( -type d \( -name '$RECYCLE.BIN' -o -name 'System Volume Information' \) -prune \) \
+    -o -type f -print0
+}
+
+find_top_level_files() {
+  local root="${1}"
+  find "${root}" -mindepth 1 -maxdepth 1 -type f -print0
 }
 
 build_mapping() {
@@ -436,7 +470,7 @@ record_provenance_for_bucket() {
       local create_status="${create_info##*|}"
       update_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${sha}"
     fi
-  done < <(find "${src_root}" -type f -not -path '*/$RECYCLE.BIN/*' -not -path '*/System Volume Information/*' -print0)
+  done < <(find_files_pruned "${src_root}")
 }
 
 record_provenance_all() {
@@ -512,7 +546,7 @@ record_provenance_loose_files() {
       local create_status="${create_info##*|}"
       update_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${dest_sha}"
     fi
-  done < <(find "${src_root}" -mindepth 1 -maxdepth 1 -type f -not -path '*/$RECYCLE.BIN/*' -not -path '*/System Volume Information/*' -print0)
+  done < <(find_top_level_files "${src_root}")
 }
 
 collision_log_candidates=""
@@ -732,7 +766,7 @@ resolve_conflicts_in_bucket() {
       local dest_file="${dest_base}/${rel}"
       resolve_one_collision "${unoe_file}" "${dose_file}" "${dest_file}"
     fi
-  done < <(find "${dose_base}" -type f -not -path '*/$RECYCLE.BIN/*' -not -path '*/System Volume Information/*' -print0)
+  done < <(find_files_pruned "${dose_base}")
 }
 
 resolve_conflicts() {
@@ -872,7 +906,7 @@ compute_create_time_manifest() {
   local missing="${LOGDIR}/50_create_time_missing.csv"
   local instructions="${LOGDIR}/51_create_time_windows_apply_instructions.txt"
 
-  python3 - <<'PY'
+  python3 - "${provenance_file}" "${manifest}" "${missing}" <<'PY'
 import csv
 import sys
 from collections import defaultdict
@@ -913,7 +947,6 @@ with open(missing, 'w', newline='') as f:
             for path in paths:
                 writer.writerow([path, sha])
 PY
-"${provenance_file}" "${manifest}" "${missing}"
 
   cat <<EOWIN > "${instructions}"
 Apply creation times from Windows after copy completes.
