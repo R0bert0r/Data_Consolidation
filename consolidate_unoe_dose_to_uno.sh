@@ -11,6 +11,7 @@ RUN_ID=""
 LOGDIR=""
 DRY_RUN=false
 PHASE="all"
+SELF_TEST=false
 
 CURRENT_ACTION="initializing"
 
@@ -49,7 +50,7 @@ require_root() {
 }
 
 check_tools() {
-  local tools=(rsync find stat sha256sum getfattr setfattr jdupes)
+  local tools=(rsync find stat sha256sum getfattr setfattr jdupes python3)
   for tool in "${tools[@]}"; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
       if [[ "${tool}" == "jdupes" ]]; then
@@ -418,7 +419,7 @@ get_create_time() {
   if value="$(getfattr -n system.ntfs_crtime_be -e hex --only-values "${file}" 2>/dev/null)"; then
     value="${value//[[:space:]]/}"
     value="${value#0x}"
-    if [[ -n "${value}" && $(( ${#value} % 2 )) -eq 0 ]]; then
+    if [[ -n "${value}" && "${value}" =~ ^[0-9a-fA-F]+$ && ${#value} -ge 16 && $(( ${#value} % 2 )) -eq 0 ]]; then
       if (( ${#value} > 16 )); then
         value="${value: -16}"
       fi
@@ -1231,11 +1232,64 @@ post_verify() {
   fi
 }
 
+self_test() {
+  log_status "Phase: self_test"
+  CURRENT_ACTION="self_test"
+  local script_path
+  script_path="$(readlink -f "$0")"
+
+  bash -n "${script_path}"
+
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  trap '[[ -n "${temp_dir:-}" ]] && rm -rf "${temp_dir}"' EXIT
+
+  local collision_csv="${temp_dir}/collision.csv"
+  local provenance_csv="${temp_dir}/provenance.csv"
+
+  echo "dest_path,classification,chosen_action,unoe_path,unoe_size,unoe_mtime_utc,unoe_sha256,dose_path,dose_size,dose_mtime_utc,dose_sha256,resulting_paths" > "${collision_csv}"
+  append_csv_row "${collision_csv}" "path with spaces,comma\"quote" "conflict" "keep_both" "/src/path,one" "123" "2024-01-01T00:00:00Z" "sha1" "/src/path two" "456" "2024-01-02T00:00:00Z" "sha2" "result,path"
+
+  echo "dest_path,source_origin,source_path,src_create_time_utc,create_time_status,src_mtime_utc,size_bytes,sha256" > "${provenance_csv}"
+  append_csv_row "${provenance_csv}" "dest,with,comma\"quote" "UNOE" "/src/path with spaces" "2024-01-01T00:00:00Z" "ok" "2024-01-02T00:00:00Z" "123" "sha256value"
+
+  python3 - "${collision_csv}" "${provenance_csv}" <<'PY'
+import csv
+import sys
+
+collision = sys.argv[1]
+provenance = sys.argv[2]
+
+with open(collision, newline='') as handle:
+    reader = csv.reader(handle)
+    header = next(reader, None)
+    if not header or len(header) < 12:
+        raise SystemExit(1)
+    row = next(reader, None)
+    if not row or len(row) < 12:
+        raise SystemExit(1)
+    if "comma\"quote" not in row[0]:
+        raise SystemExit(1)
+
+with open(provenance, newline='') as handle:
+    reader = csv.DictReader(handle)
+    row = next(reader, None)
+    if not row or 'dest_path' not in row:
+        raise SystemExit(1)
+    if "comma\"quote" not in row['dest_path']:
+        raise SystemExit(1)
+PY
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run)
         DRY_RUN=true
+        shift
+        ;;
+      --self-test)
+        SELF_TEST=true
         shift
         ;;
       --phase)
@@ -1266,6 +1320,7 @@ parse_args() {
 run_phase() {
   local name="${1}"
   case "${name}" in
+    self_test) self_test ;;
     preflight) preflight ;;
     prepare_dest) prepare_dest ;;
     copy_unoe) copy_unoe ;;
@@ -1296,6 +1351,10 @@ run_phase() {
 
 main() {
   parse_args "$@"
+  if [[ "${SELF_TEST}" == "true" ]]; then
+    self_test
+    return 0
+  fi
   require_root
   check_tools
   build_mapping
