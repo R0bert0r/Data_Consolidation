@@ -76,6 +76,34 @@ log_status() {
   echo "[${SCRIPT_NAME}] ${1} (logs: ${LOGDIR})"
 }
 
+csv_escape() {
+  local value="${1}"
+  local escaped="${value//\"/\"\"}"
+  if [[ "${escaped}" == *","* || "${escaped}" == *"\""* || "${escaped}" == *$'\n'* || "${escaped}" =~ ^[[:space:]] || "${escaped}" =~ [[:space:]]$ ]]; then
+    printf '"%s"' "${escaped}"
+  else
+    printf '%s' "${escaped}"
+  fi
+}
+
+append_csv_row() {
+  local file="${1}"
+  shift
+  local first=true
+  local field
+  {
+    for field in "$@"; do
+      if [[ "${first}" == "true" ]]; then
+        first=false
+      else
+        printf ','
+      fi
+      csv_escape "${field}"
+    done
+    printf '\n'
+  } >> "${file}"
+}
+
 is_excluded_dir_name() {
   local name="${1}"
   if [[ "${name}" == "\$RECYCLE.BIN" || "${name}" == "System Volume Information" ]]; then
@@ -157,10 +185,33 @@ verify_rsync_dryrun() {
 }
 
 normalize_permissions() {
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    log_status "Dry run: skipping permission normalization"
+    return 0
+  fi
+
   CURRENT_ACTION="normalize permissions"
-  chown -R tom:sambashare "${UNO_ROOT}"
-  find "${UNO_ROOT}" -type d -exec chmod 2775 {} +
-  find "${UNO_ROOT}" -type f -exec chmod 664 {} +
+  local scopes=(
+    "${UNO_ROOT}/01_Knowledge"
+    "${UNO_ROOT}/02_Media"
+    "${UNO_ROOT}/03_Technology"
+    "${UNO_ROOT}/04_Personal"
+    "${UNO_ROOT}/Research"
+    "${UNO_ROOT}/ASH"
+    "${UNO_ROOT}/Backups"
+    "${UNO_ROOT}/Dropbox"
+    "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders"
+    "${UNO_ROOT}/90_System_Artifacts/Loose_Files"
+  )
+
+  for scope in "${scopes[@]}"; do
+    if [[ -d "${scope}" ]]; then
+      chown -R tom:sambashare "${scope}"
+      find "${scope}" -type d -exec chmod 2775 {} +
+      find "${scope}" -type f -perm /111 -exec chmod 775 {} +
+      find "${scope}" -type f ! -perm /111 -exec chmod 664 {} +
+    fi
+  done
 }
 
 preflight() {
@@ -190,9 +241,7 @@ prepare_dest() {
   mkdir -p "${UNO_ROOT}/90_System_Artifacts/Recovery/found.000"
   mkdir -p "${UNO_ROOT}/02_Media/Photos/_From_Root/UNOE"
   mkdir -p "${UNO_ROOT}/02_Media/Photos/_From_Root/DOSE"
-  if [[ "${DRY_RUN}" == "false" ]]; then
-    normalize_permissions
-  fi
+  normalize_permissions
 }
 
 is_image_file() {
@@ -363,59 +412,64 @@ size_bytes() {
 
 get_create_time() {
   local file="${1}"
-  local attr
   local value
   local parsed
-  for attr in system.ntfs_crtime_be user.ntfs_crtime; do
-    if value="$(getfattr -n "${attr}" --only-values --absolute-names "${file}" 2>/dev/null)"; then
-      if [[ -n "${value}" ]]; then
-        if [[ "${attr}" == "system.ntfs_crtime_be" ]]; then
-          if parsed="$(python3 - <<'PY'
+
+  if value="$(getfattr -n system.ntfs_crtime_be -e hex --only-values "${file}" 2>/dev/null)"; then
+    value="${value//[[:space:]]/}"
+    value="${value#0x}"
+    if [[ -n "${value}" && $(( ${#value} % 2 )) -eq 0 ]]; then
+      if (( ${#value} > 16 )); then
+        value="${value: -16}"
+      fi
+      if parsed="$(python3 - <<'PY'
 import sys
 value = sys.stdin.read().strip()
 try:
-    data = bytes.fromhex(value)
-    if len(data) != 8:
-        raise ValueError("length")
-    ts = int.from_bytes(data, byteorder='big', signed=False)
-    epoch = (ts / 10_000_000) - 11644473600
-    if epoch < 0:
+    if len(value) < 16:
+        raise ValueError("short")
+    filetime = int(value, 16)
+    unix = (filetime / 10_000_000) - 11644473600
+    if unix < 0:
         raise ValueError("negative")
     from datetime import datetime, timezone
+    dt = datetime.fromtimestamp(unix, tz=timezone.utc)
+    print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
+except Exception:
+    sys.exit(1)
+PY
+<<<"${value}" 2>/dev/null)"; then
+        echo "${parsed}|ok"
+        return 0
+      fi
+      echo "|parse_error"
+      return 0
+    fi
+  fi
+
+  if value="$(getfattr -n user.ntfs_crtime -e text --only-values "${file}" 2>/dev/null)"; then
+    value="${value//[[:space:]]/}"
+    if [[ "${value}" =~ ^[0-9]+$ ]]; then
+      if parsed="$(python3 - <<'PY'
+import sys
+value = sys.stdin.read().strip()
+try:
+    from datetime import datetime, timezone
+    epoch = int(value)
     dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
     print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
 except Exception:
     sys.exit(1)
 PY
 <<<"${value}" 2>/dev/null)"; then
-            echo "${parsed}|ok"
-            return 0
-          fi
-        else
-          if parsed="$(python3 - <<'PY'
-import sys
-value = sys.stdin.read().strip()
-try:
-    from datetime import datetime, timezone
-    if value.isdigit():
-        epoch = int(value)
-        dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
-        print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
-    else:
-        raise ValueError("format")
-except Exception:
-    sys.exit(1)
-PY
-<<<"${value}" 2>/dev/null)"; then
-            echo "${parsed}|ok"
-            return 0
-          fi
-        fi
-        echo "|parse_error"
+        echo "${parsed}|ok"
         return 0
       fi
+      echo "|parse_error"
+      return 0
     fi
-  done
+  fi
+
   echo "|missing"
 }
 
@@ -438,16 +492,43 @@ append_provenance() {
   local size="${7}"
   local sha="${8}"
 
-  python3 - "${provenance_file}" "${dest_rel}" "${origin}" "${src_path}" "${create_time}" "${create_status}" "${src_mtime}" "${size}" "${sha}" <<'PY'
+  append_csv_row "${provenance_file}" "${dest_rel}" "${origin}" "${src_path}" "${create_time}" "${create_status}" "${src_mtime}" "${size}" "${sha}"
+}
+
+create_time_coverage() {
+  local report="${LOGDIR}/52_create_time_coverage.txt"
+  python3 - "${provenance_file}" "${report}" <<'PY'
 import csv
 import sys
 
-output = sys.argv[1]
-row = sys.argv[2:]
+provenance = sys.argv[1]
+report = sys.argv[2]
 
-with open(output, 'a', newline='') as handle:
-    writer = csv.writer(handle)
-    writer.writerow(row)
+total = 0
+ok_count = 0
+missing_count = 0
+parse_error_count = 0
+
+try:
+    with open(provenance, newline='') as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            total += 1
+            status = (row.get('create_time_status') or '').strip()
+            if status == 'ok':
+                ok_count += 1
+            elif status == 'missing':
+                missing_count += 1
+            elif status == 'parse_error':
+                parse_error_count += 1
+except Exception:
+    pass
+
+with open(report, 'w') as handle:
+    handle.write(f"total_files_seen={total}\n")
+    handle.write(f"ok_count={ok_count}\n")
+    handle.write(f"missing_count={missing_count}\n")
+    handle.write(f"parse_error_count={parse_error_count}\n")
 PY
 }
 
@@ -561,6 +642,8 @@ record_provenance_all() {
 
   record_provenance_loose_files "${UNOE_ROOT}" "UNOE"
   record_provenance_loose_files "${DOSE_ROOT}" "DOSE"
+
+  create_time_coverage
 }
 
 collision_log_candidates=""
@@ -638,12 +721,12 @@ resolve_one_collision() {
     classification="identical"
     action="no_action"
     resulting_paths="${dest_file}"
-    echo "${dest_file},${classification},${action},${unoe_file},${unoe_size},${unoe_mtime},${unoe_sha},${dose_file},${dose_size},${dose_mtime},${dose_sha},${resulting_paths}" >> "${collision_log_candidates}"
+    append_csv_row "${collision_log_candidates}" "${dest_file}" "${classification}" "${action}" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" "${resulting_paths}"
     return 0
   fi
 
   classification="conflict"
-  echo "${dest_file},${classification},pending,${unoe_file},${unoe_size},${unoe_mtime},${unoe_sha},${dose_file},${dose_size},${dose_mtime},${dose_sha}," >> "${collision_log_candidates}"
+  append_csv_row "${collision_log_candidates}" "${dest_file}" "${classification}" "pending" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" ""
 
   local newest="UNOE"
   local unoe_epoch dose_epoch
@@ -707,7 +790,7 @@ resolve_one_collision() {
     resulting_paths="${dest_file};${suffixed}"
   fi
 
-  echo "${dest_file},${classification},${action},${unoe_file},${unoe_size},${unoe_mtime},${unoe_sha},${dose_file},${dose_size},${dose_mtime},${dose_sha},${resulting_paths}" >> "${collision_log_resolution}"
+  append_csv_row "${collision_log_resolution}" "${dest_file}" "${classification}" "${action}" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" "${resulting_paths}"
 
   if [[ "${DRY_RUN}" == "false" ]]; then
     local dest_rel
@@ -848,7 +931,7 @@ try:
                 print(path)
             else:
                 print(os.path.join(uno_root, path))
-except OSError:
+except Exception:
     pass
 PY
   fi
@@ -864,8 +947,8 @@ seed = sys.argv[1]
 bucket = sys.argv[2]
 
 rng = random.Random(f"{seed}|{bucket}")
-
 files = []
+
 try:
     for root, dirnames, filenames in os.walk(bucket):
         dirnames[:] = [d for d in dirnames if d not in ('$RECYCLE.BIN', 'System Volume Information')]
@@ -875,9 +958,9 @@ try:
                 if os.path.isfile(path):
                     size = os.path.getsize(path)
                     files.append((size, path))
-            except OSError:
+            except Exception:
                 continue
-except OSError:
+except Exception:
     files = []
 
 if not files:
@@ -918,7 +1001,7 @@ try:
                 continue
             seen.add(path)
             print(path)
-except OSError:
+except Exception:
     pass
 PY
   mv "${hash_sample_file}.tmp" "${hash_sample_file}"
@@ -939,7 +1022,7 @@ try:
         writer.writerow(['path', 'sha256', 'size_bytes'])
         try:
             sample_handle = open(sample_list, 'r', encoding='utf-8', errors='replace')
-        except OSError:
+        except Exception:
             sample_handle = None
         if sample_handle:
             with sample_handle:
@@ -949,7 +1032,7 @@ try:
                         continue
                     try:
                         size = os.path.getsize(path)
-                    except OSError:
+                    except Exception:
                         continue
                     rel_path = path[len(uno_root) + 1:] if path.startswith(uno_root + os.sep) else path
                     try:
@@ -958,10 +1041,10 @@ try:
                             for chunk in iter(lambda: data_handle.read(1024 * 1024), b''):
                                 sha256.update(chunk)
                         digest = sha256.hexdigest()
-                    except OSError:
+                    except Exception:
                         continue
                     writer.writerow([rel_path, digest, size])
-except OSError:
+except Exception:
     pass
 PY
 }
@@ -987,11 +1070,14 @@ dedupe_hardlinks() {
     "${UNO_ROOT}/03_Technology"
     "${UNO_ROOT}/04_Personal"
     "${UNO_ROOT}/Research"
+    "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders"
+    "${UNO_ROOT}/90_System_Artifacts/Loose_Files"
+    "${UNO_ROOT}/02_Media/Photos/_From_Root"
   )
 
-  jdupes -r -L "${dedupe_dirs[@]}" | tee "${LOGDIR}/60_dedupe_report.txt"
-  jdupes -r -L -v "${dedupe_dirs[@]}" > "${LOGDIR}/61_dedupe_actions.txt"
-  jdupes -r -S "${dedupe_dirs[@]}" > "${LOGDIR}/62_dedupe_space_savings.txt"
+  jdupes -r -L "${dedupe_dirs[@]}" 2>&1 | tee "${LOGDIR}/60_dedupe_report.txt"
+  jdupes -r -L -v "${dedupe_dirs[@]}" 2>&1 > "${LOGDIR}/61_dedupe_actions.txt"
+  jdupes -r -S "${dedupe_dirs[@]}" 2>&1 > "${LOGDIR}/62_dedupe_space_savings.txt"
 }
 
 compute_create_time_manifest() {
@@ -1000,6 +1086,12 @@ compute_create_time_manifest() {
   if [[ "${DRY_RUN}" == "true" ]]; then
     echo "DRY RUN: create time manifest skipped" > "${LOGDIR}/50_create_time_manifest.csv"
     return 0
+  fi
+
+  init_provenance
+  if [[ ! -s "${provenance_file}" || "$(wc -l < "${provenance_file}")" -le 1 ]]; then
+    echo "ERROR: Provenance file missing/empty; run provenance phase first." >&2
+    exit 1
   fi
 
   local manifest="${LOGDIR}/50_create_time_manifest.csv"
@@ -1022,6 +1114,7 @@ sha_groups = defaultdict(list)
 create_times = defaultdict(list)
 all_entries = []
 
+
 def normalize_dest(path):
     if not path:
         return ""
@@ -1029,9 +1122,11 @@ def normalize_dest(path):
         return path
     return os.path.join(uno_root, path)
 
+
 def record_create_time(group_key, ctime):
     if group_key and ctime:
         create_times[group_key].append(ctime)
+
 
 try:
     with open(provenance, newline='') as handle:
@@ -1048,8 +1143,8 @@ try:
             try:
                 if dest_abs and os.path.isfile(dest_abs):
                     stat_info = os.stat(dest_abs)
-                    inode_key = f"inode:{stat_info.st_dev}:{stat_info.st_ino}"
-            except OSError:
+                    inode_key = (stat_info.st_dev, stat_info.st_ino)
+            except Exception:
                 inode_key = ""
 
             if inode_key:
@@ -1057,11 +1152,11 @@ try:
                 if status == 'ok' and ctime:
                     record_create_time(inode_key, ctime)
             elif sha:
-                sha_key = f"sha:{sha}"
+                sha_key = ("sha", sha)
                 sha_groups[sha_key].append(dest_rel)
                 if status == 'ok' and ctime:
                     record_create_time(sha_key, ctime)
-except OSError:
+except Exception:
     pass
 
 manifest_paths = {}
@@ -1079,7 +1174,7 @@ try:
         writer.writerow(['dest_path_relative_to_share', 'earliest_create_time_utc_iso8601'])
         for path, earliest in manifest_paths.items():
             writer.writerow([path, earliest])
-except OSError:
+except Exception:
     pass
 
 missing_rows = {}
@@ -1088,7 +1183,7 @@ for dest_rel, dest_abs, sha in all_entries:
         continue
     if dest_rel in manifest_paths:
         continue
-    if not dest_abs or not os.path.isfile(dest_abs):
+    if not dest_abs or not os.path.exists(dest_abs):
         reason = "destination_missing"
     elif not sha:
         reason = "missing_identity_key"
@@ -1102,7 +1197,7 @@ try:
         writer.writerow(['dest_path', 'reason', 'sha256'])
         for dest_rel, reason, sha in missing_rows.keys():
             writer.writerow([dest_rel, reason, sha])
-except OSError:
+except Exception:
     pass
 PY
 
@@ -1121,13 +1216,16 @@ post_verify() {
   verify_counts_bytes "${LOGDIR}/70_verify_counts_bytes_post_dedupe.txt"
 
   if [[ -f "${hash_sample_file}" ]]; then
-    echo "path,sha256,size_bytes" > "${LOGDIR}/71_verify_hash_sample_post_dedupe.csv"
+    local output_file="${LOGDIR}/71_verify_hash_sample_post_dedupe.csv"
+    echo "path,sha256,size_bytes" > "${output_file}"
     while IFS= read -r file; do
       if [[ -f "${file}" ]]; then
         local sha size
         sha="$(sha256_file "${file}")"
         size="$(size_bytes "${file}")"
-        echo "${file#${UNO_ROOT}/},${sha},${size}" >> "${LOGDIR}/71_verify_hash_sample_post_dedupe.csv"
+        local rel_path
+        rel_path="${file#${UNO_ROOT}/}"
+        append_csv_row "${output_file}" "${rel_path}" "${sha}" "${size}"
       fi
     done < "${hash_sample_file}"
   fi
@@ -1204,9 +1302,7 @@ main() {
   init_run
   log_status "Starting run ${RUN_ID} (phase: ${PHASE}, dry-run: ${DRY_RUN})"
   run_phase "${PHASE}"
-  if [[ "${DRY_RUN}" == "false" ]]; then
-    normalize_permissions
-  fi
+  normalize_permissions
   log_status "Completed"
 }
 
