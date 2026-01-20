@@ -108,7 +108,7 @@ csv_row() {
 
 is_excluded_dir_name() {
   local name="${1}"
-  if [[ "${name}" == "\$RECYCLE.BIN" || "${name}" == "System Volume Information" ]]; then
+  if [[ "${name}" == '$RECYCLE.BIN' || "${name}" == "System Volume Information" ]]; then
     return 0
   fi
   return 1
@@ -128,10 +128,10 @@ find_top_level_files() {
 
 rsync_excludes() {
   RSYNC_EXCLUDES=(
-    "--exclude=\$RECYCLE.BIN/"
-    "--exclude=\$RECYCLE.BIN/***"
-    "--exclude=System Volume Information/"
-    "--exclude=System Volume Information/***"
+    '--exclude=$RECYCLE.BIN/'
+    '--exclude=$RECYCLE.BIN/***'
+    '--exclude=System Volume Information/'
+    '--exclude=System Volume Information/***'
   )
 }
 
@@ -142,7 +142,7 @@ rsync_common_flags() {
 run_rsync() {
   local src="${1}"
   local dest="${2}"
-  local extra_flags="${3}"
+  local extra_flags_name="${3}"
   local log_file="${4}"
   local -a cmd
   local -a extra=()
@@ -150,8 +150,9 @@ run_rsync() {
   rsync_common_flags
   rsync_excludes
 
-  if [[ -n "${extra_flags}" ]]; then
-    read -r -a extra <<< "${extra_flags}"
+  if [[ -n "${extra_flags_name}" ]]; then
+    local -n extra_ref="${extra_flags_name}"
+    extra=("${extra_ref[@]}")
   fi
 
   cmd=(rsync "${RSYNC_COMMON_FLAGS[@]}" "${RSYNC_EXCLUDES[@]}")
@@ -167,7 +168,7 @@ run_rsync() {
 verify_rsync_dryrun() {
   local src="${1}"
   local dest="${2}"
-  local extra_flags="${3}"
+  local extra_flags_name="${3}"
   local log_file="${4}"
   local -a cmd
   local -a extra=()
@@ -175,8 +176,9 @@ verify_rsync_dryrun() {
   rsync_common_flags
   rsync_excludes
 
-  if [[ -n "${extra_flags}" ]]; then
-    read -r -a extra <<< "${extra_flags}"
+  if [[ -n "${extra_flags_name}" ]]; then
+    local -n extra_ref="${extra_flags_name}"
+    extra=("${extra_ref[@]}")
   fi
 
   cmd=(rsync "${RSYNC_COMMON_FLAGS[@]}" "${RSYNC_EXCLUDES[@]}" --dry-run)
@@ -299,15 +301,15 @@ copy_as_is_folders() {
   local overlay="${4}"
   local verify_prefix="${5}"
   local log_file="${LOGDIR}/${phase_label}_as_is_${origin}.log"
-  local extra_flags=""
+  local -a extra_flags=()
   local folders=("ASH" "Backups" "Dropbox")
   if [[ "${overlay}" == "true" ]]; then
-    extra_flags="--ignore-existing"
+    extra_flags=(--ignore-existing)
   fi
   for folder in "${folders[@]}"; do
     if [[ -d "${src_root}/${folder}" ]]; then
-      run_rsync "${src_root}/${folder}/" "${UNO_ROOT}/${folder}/" "${extra_flags}" "${log_file}"
-      verify_rsync_dryrun "${src_root}/${folder}/" "${UNO_ROOT}/${folder}/" "${extra_flags}" "${LOGDIR}/${verify_prefix}_verify_dryrun_${folder}_${origin}.txt"
+      run_rsync "${src_root}/${folder}/" "${UNO_ROOT}/${folder}/" extra_flags "${log_file}"
+      verify_rsync_dryrun "${src_root}/${folder}/" "${UNO_ROOT}/${folder}/" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_${folder}_${origin}.txt"
     fi
   done
 }
@@ -319,9 +321,9 @@ copy_mapped_and_unmapped() {
   local overlay="${4}"
   local verify_prefix="${5}"
   local log_file="${LOGDIR}/${phase_label}_mapped_${origin}.log"
-  local extra_flags=""
+  local -a extra_flags=()
   if [[ "${overlay}" == "true" ]]; then
-    extra_flags="--ignore-existing"
+    extra_flags=(--ignore-existing)
   fi
 
   while IFS= read -r -d '' entry; do
@@ -337,17 +339,17 @@ copy_mapped_and_unmapped() {
     fi
 
     if [[ "${name}" == "found.000" ]]; then
-      run_rsync "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Recovery/found.000/" "${extra_flags}" "${log_file}"
-      verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Recovery/found.000/" "${extra_flags}" "${LOGDIR}/${verify_prefix}_verify_dryrun_found.000_${origin}.txt"
+      run_rsync "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Recovery/found.000/" extra_flags "${log_file}"
+      verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Recovery/found.000/" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_found.000_${origin}.txt"
       continue
     fi
 
     if [[ -n "${MAP[${name}]:-}" ]]; then
-      run_rsync "${entry}/" "${UNO_ROOT}/${MAP[${name}]}/" "${extra_flags}" "${log_file}"
-      verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/${MAP[${name}]}/" "${extra_flags}" "${LOGDIR}/${verify_prefix}_verify_dryrun_${name}_${origin}.txt"
+      run_rsync "${entry}/" "${UNO_ROOT}/${MAP[${name}]}/" extra_flags "${log_file}"
+      verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/${MAP[${name}]}/" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_${name}_${origin}.txt"
     else
-      run_rsync "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/${origin}/${name}/" "${extra_flags}" "${log_file}"
-      verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/${origin}/${name}/" "${extra_flags}" "${LOGDIR}/${verify_prefix}_verify_dryrun_unmapped_${name}_${origin}.txt"
+      run_rsync "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/${origin}/${name}/" extra_flags "${log_file}"
+      verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/${origin}/${name}/" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_unmapped_${name}_${origin}.txt"
     fi
   done < <(find "${src_root}" -mindepth 1 -maxdepth 1 -type d -print0)
 }
@@ -358,9 +360,9 @@ copy_loose_files() {
   local phase_label="${3}"
   local overlay="${4}"
   local verify_prefix="${5}"
-  local extra_flags=""
+  local -a extra_flags=()
   if [[ "${overlay}" == "true" ]]; then
-    extra_flags="--ignore-existing"
+    extra_flags=(--ignore-existing)
   fi
 
   local log_file="${LOGDIR}/${phase_label}_loose_${origin}.log"
@@ -372,11 +374,11 @@ copy_loose_files() {
       continue
     fi
     if is_image_file "${base}"; then
-      run_rsync "${file}" "${UNO_ROOT}/02_Media/Photos/_From_Root/${origin}/${base}" "${extra_flags}" "${log_file}"
-      verify_rsync_dryrun "${file}" "${UNO_ROOT}/02_Media/Photos/_From_Root/${origin}/${base}" "${extra_flags}" "${LOGDIR}/${verify_prefix}_verify_dryrun_loose_images_${origin}.txt"
+      run_rsync "${file}" "${UNO_ROOT}/02_Media/Photos/_From_Root/${origin}/${base}" extra_flags "${log_file}"
+      verify_rsync_dryrun "${file}" "${UNO_ROOT}/02_Media/Photos/_From_Root/${origin}/${base}" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_loose_images_${origin}.txt"
     else
-      run_rsync "${file}" "${UNO_ROOT}/90_System_Artifacts/Loose_Files/${origin}/${base}" "${extra_flags}" "${log_file}"
-      verify_rsync_dryrun "${file}" "${UNO_ROOT}/90_System_Artifacts/Loose_Files/${origin}/${base}" "${extra_flags}" "${LOGDIR}/${verify_prefix}_verify_dryrun_loose_files_${origin}.txt"
+      run_rsync "${file}" "${UNO_ROOT}/90_System_Artifacts/Loose_Files/${origin}/${base}" extra_flags "${log_file}"
+      verify_rsync_dryrun "${file}" "${UNO_ROOT}/90_System_Artifacts/Loose_Files/${origin}/${base}" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_loose_files_${origin}.txt"
     fi
   done < <(find_top_level_files "${src_root}")
 }
