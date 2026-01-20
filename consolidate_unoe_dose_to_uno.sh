@@ -593,6 +593,11 @@ record_provenance_loose_files() {
   local origin="${2}"
 
   while IFS= read -r -d '' file; do
+    local rel
+    rel="${file#${src_root}/}"
+    if [[ "${rel}" == */* ]]; then
+      continue
+    fi
     local base
     base="$(basename "${file}")"
     if is_excluded_dir_name "${base}"; then
@@ -622,7 +627,7 @@ record_provenance_loose_files() {
       local create_status="${create_info##*|}"
       append_provenance "${dest_rel}" "${origin}" "${file}" "${create_time}" "${create_status}" "${mtime}" "${size}" "${dest_sha}"
     fi
-  done < <(find_top_level_files "${src_root}")
+  done < <(find_files_pruned "${src_root}")
 }
 
 record_provenance_all() {
