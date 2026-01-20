@@ -2,8 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SCRIPT_PATH="${REPO_DIR}/consolidate_unoe_dose_to_uno.sh"
+REPO_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || true)"
+SCRIPT_PATH=""
+
+if [[ -n "${REPO_DIR}" && -f "${REPO_DIR}/consolidate_unoe_dose_to_uno.sh" ]]; then
+  SCRIPT_PATH="${REPO_DIR}/consolidate_unoe_dose_to_uno.sh"
+elif [[ -f "${SCRIPT_DIR}/consolidate_unoe_dose_to_uno.sh" ]]; then
+  SCRIPT_PATH="${SCRIPT_DIR}/consolidate_unoe_dose_to_uno.sh"
+elif [[ -f "${SCRIPT_DIR}/../consolidate_unoe_dose_to_uno.sh" ]]; then
+  SCRIPT_PATH="${SCRIPT_DIR}/../consolidate_unoe_dose_to_uno.sh"
+else
+  echo "ERROR: consolidate_unoe_dose_to_uno.sh not found." >&2
+  exit 1
+fi
 
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TEMP_DIR}"' EXIT

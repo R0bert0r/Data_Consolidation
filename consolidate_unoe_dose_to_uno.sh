@@ -81,7 +81,7 @@ log_status() {
 csv_quote() {
   local value="${1}"
   local escaped="${value//\"/\"\"}"
-  if [[ "${escaped}" == *","* || "${escaped}" == *"\""* || "${escaped}" == *$'\n'* || "${escaped}" =~ ^[[:space:]] || "${escaped}" =~ [[:space:]]$ ]]; then
+  if [[ "${escaped}" == *","* || "${escaped}" == *"\""* || "${escaped}" == *$'\n'* || "${escaped}" == *$'\r'* || "${escaped}" =~ ^[[:space:]] || "${escaped}" =~ [[:space:]]$ ]]; then
     printf '"%s"' "${escaped}"
   else
     printf '%s' "${escaped}"
@@ -415,9 +415,9 @@ size_bytes() {
 
 get_create_time() {
   local file="${1}"
-  local value
   local parsed
-  local endian
+  local value
+  local attr_present=false
 
   local birth
   birth="$(stat -c %W "${file}" 2>/dev/null || echo 0)"
@@ -428,91 +428,58 @@ get_create_time() {
     fi
   fi
 
-  if value="$(getfattr -h -e hex -n system.ntfs_crtime_be --only-values "${file}" 2>/dev/null)"; then
-    value="${value//[[:space:]]/}"
-    value="${value#0x}"
-    if [[ -n "${value}" && "${value}" =~ ^[0-9a-fA-F]+$ && ${#value} -ge 16 && $(( ${#value} % 2 )) -eq 0 ]]; then
-      if (( ${#value} > 16 )); then
-        value="${value: -16}"
-      fi
-      endian="big"
-      if parsed="$(python3 - "${value}" "${endian}" <<'PY'
+  local -a attr_keys=("system.ntfs_crtime_be:big" "system.ntfs_crtime:native" "user.ntfs_crtime_be:big" "user.ntfs_crtime:native")
+  local entry
+  for entry in "${attr_keys[@]}"; do
+    local key="${entry%%:*}"
+    local mode="${entry##*:}"
+    value="$(getfattr -h --only-values -n "${key}" -e hex "${file}" 2>/dev/null | tr -d '\n')"
+    if [[ -z "${value}" ]]; then
+      continue
+    fi
+    attr_present=true
+    if parsed="$(python3 - "${value}" "${mode}" <<'PY'
 import sys
+
 value = sys.argv[1].strip()
-endian = sys.argv[2].strip().lower()
+mode = sys.argv[2].strip().lower()
+if value.startswith(("0x", "0X")):
+    value = value[2:]
+if len(value) != 16:
+    raise SystemExit(1)
 try:
-    if len(value) < 16:
-        raise ValueError("short")
     raw = bytes.fromhex(value)
-    if len(raw) != 8:
-        raise ValueError("length")
-    if endian == "big":
-        filetime = int.from_bytes(raw, "big")
-    elif endian == "little":
-        filetime = int.from_bytes(raw, "little")
-    else:
-        raise ValueError("endian")
-    unix = (filetime / 10_000_000) - 11644473600
-    if unix < 0:
-        raise ValueError("negative")
-    from datetime import datetime, timezone
-    dt = datetime.fromtimestamp(unix, tz=timezone.utc)
-    print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
-except Exception:
-    sys.exit(1)
+except ValueError:
+    raise SystemExit(1)
+if len(raw) != 8:
+    raise SystemExit(1)
+
+if mode == "big":
+    endian = "big"
+elif mode == "native":
+    endian = sys.byteorder
+else:
+    raise SystemExit(1)
+
+filetime = int.from_bytes(raw, endian)
+unix = (filetime // 10_000_000) - 11644473600
+if unix < 0:
+    raise SystemExit(1)
+from datetime import datetime, timezone
+dt = datetime.fromtimestamp(unix, tz=timezone.utc)
+print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
 PY
 2>/dev/null)"; then
-        echo "${parsed}|ok"
-        return 0
-      fi
-      echo "|parse_error"
+      echo "${parsed}|ok"
       return 0
     fi
-  fi
+  done
 
-  if value="$(getfattr -h -e hex -n system.ntfs_crtime --only-values "${file}" 2>/dev/null)"; then
-    value="${value//[[:space:]]/}"
-    value="${value#0x}"
-    if [[ -n "${value}" && "${value}" =~ ^[0-9a-fA-F]+$ && ${#value} -ge 16 && $(( ${#value} % 2 )) -eq 0 ]]; then
-      if (( ${#value} > 16 )); then
-        value="${value: -16}"
-      fi
-      endian="little"
-      if parsed="$(python3 - "${value}" "${endian}" <<'PY'
-import sys
-value = sys.argv[1].strip()
-endian = sys.argv[2].strip().lower()
-try:
-    if len(value) < 16:
-        raise ValueError("short")
-    raw = bytes.fromhex(value)
-    if len(raw) != 8:
-        raise ValueError("length")
-    if endian == "big":
-        filetime = int.from_bytes(raw, "big")
-    elif endian == "little":
-        filetime = int.from_bytes(raw, "little")
-    else:
-        raise ValueError("endian")
-    unix = (filetime / 10_000_000) - 11644473600
-    if unix < 0:
-        raise ValueError("negative")
-    from datetime import datetime, timezone
-    dt = datetime.fromtimestamp(unix, tz=timezone.utc)
-    print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
-except Exception:
-    sys.exit(1)
-PY
-2>/dev/null)"; then
-        echo "${parsed}|ok"
-        return 0
-      fi
-      echo "|parse_error"
-      return 0
-    fi
+  if [[ "${attr_present}" == "true" ]]; then
+    echo "|parse_error"
+  else
+    echo "|missing"
   fi
-
-  echo "|missing"
 }
 
 provenance_file=""
@@ -1344,25 +1311,39 @@ PY
 import datetime
 import sys
 
-def filetime_to_iso(hex_value, endian):
-    raw = bytes.fromhex(hex_value)
+def filetime_to_iso(value, mode):
+    value = value.strip()
+    if value.startswith(("0x", "0X")):
+        value = value[2:]
+    if len(value) != 16:
+        raise SystemExit(1)
+    raw = bytes.fromhex(value)
     if len(raw) != 8:
         raise SystemExit(1)
+    if mode == "big":
+        endian = "big"
+    elif mode == "little":
+        endian = "little"
+    else:
+        raise SystemExit(1)
     filetime = int.from_bytes(raw, endian)
-    unix = (filetime / 10_000_000) - 11644473600
+    unix = (filetime // 10_000_000) - 11644473600
     if unix < 0:
         raise SystemExit(1)
     dt = datetime.datetime.fromtimestamp(unix, tz=datetime.timezone.utc)
     return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-expected = "2020-01-01T00:00:00Z"
-big_hex = "01d5c03669050000"
-little_hex = "0000056936c0d501"
+expected = "1970-01-01T00:00:00Z"
+cases = [
+    ("0x019db1ded53e8000", "big"),
+    ("019db1ded53e8000", "big"),
+    ("0x00803ed5deb19d01", "little"),
+    ("00803ed5deb19d01", "little"),
+]
 
-if filetime_to_iso(big_hex, "big") != expected:
-    raise SystemExit(1)
-if filetime_to_iso(little_hex, "little") != expected:
-    raise SystemExit(1)
+for value, mode in cases:
+    if filetime_to_iso(value, mode) != expected:
+        raise SystemExit(1)
 PY
 }
 
