@@ -5,7 +5,7 @@
 Run the lightweight checks (no NAS mounts required):
 
 ```bash
-./tests/smoke.sh
+./smoke.sh
 ```
 
 This validates:

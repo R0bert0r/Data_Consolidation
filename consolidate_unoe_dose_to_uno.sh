@@ -210,8 +210,7 @@ normalize_permissions() {
     if [[ -d "${scope}" ]]; then
       chown -R tom:sambashare "${scope}"
       find "${scope}" -type d -exec chmod 2775 {} +
-      find "${scope}" -type f -exec chmod g+rw {} +
-      find "${scope}" -type f -perm /111 -exec chmod g+x {} +
+      find "${scope}" -type f -exec chmod u+rwX,g+rwX,o-rwx {} +
     fi
   done
 }
@@ -426,16 +425,16 @@ get_create_time() {
     fi
   fi
 
-  if value="$(getfattr -n system.ntfs_crtime_be -e hex --only-values "${file}" 2>/dev/null)"; then
+  if value="$(getfattr -h -e hex -n system.ntfs_crtime_be --only-values "${file}" 2>/dev/null)"; then
     value="${value//[[:space:]]/}"
     value="${value#0x}"
     if [[ -n "${value}" && "${value}" =~ ^[0-9a-fA-F]+$ && ${#value} -ge 16 && $(( ${#value} % 2 )) -eq 0 ]]; then
       if (( ${#value} > 16 )); then
         value="${value: -16}"
       fi
-      if parsed="$(python3 - <<'PY'
+      if parsed="$(python3 - "${value}" <<'PY'
 import sys
-value = sys.stdin.read().strip()
+value = sys.argv[1].strip()
 try:
     if len(value) < 16:
         raise ValueError("short")
@@ -449,7 +448,7 @@ try:
 except Exception:
     sys.exit(1)
 PY
-<<<"${value}" 2>/dev/null)"; then
+2>/dev/null)"; then
         echo "${parsed}|ok"
         return 0
       fi
@@ -458,21 +457,30 @@ PY
     fi
   fi
 
-  if value="$(getfattr -n user.ntfs_crtime -e text --only-values "${file}" 2>/dev/null)"; then
+  if value="$(getfattr -h -e hex -n system.ntfs_crtime --only-values "${file}" 2>/dev/null)"; then
     value="${value//[[:space:]]/}"
-    if [[ "${value}" =~ ^[0-9]+$ ]]; then
-      if parsed="$(python3 - <<'PY'
+    value="${value#0x}"
+    if [[ -n "${value}" && "${value}" =~ ^[0-9a-fA-F]+$ && ${#value} -ge 16 && $(( ${#value} % 2 )) -eq 0 ]]; then
+      if (( ${#value} > 16 )); then
+        value="${value: -16}"
+      fi
+      if parsed="$(python3 - "${value}" <<'PY'
 import sys
-value = sys.stdin.read().strip()
+value = sys.argv[1].strip()
 try:
+    if len(value) < 16:
+        raise ValueError("short")
+    filetime = int(value, 16)
+    unix = (filetime / 10_000_000) - 11644473600
+    if unix < 0:
+        raise ValueError("negative")
     from datetime import datetime, timezone
-    epoch = int(value)
-    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    dt = datetime.fromtimestamp(unix, tz=timezone.utc)
     print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
 except Exception:
     sys.exit(1)
 PY
-<<<"${value}" 2>/dev/null)"; then
+2>/dev/null)"; then
         echo "${parsed}|ok"
         return 0
       fi
@@ -1206,9 +1214,9 @@ for dest_rel, dest_abs, sha in all_entries:
 try:
     with open(missing, 'w', newline='') as handle:
         writer = csv.writer(handle)
-        writer.writerow(['dest_path', 'reason', 'sha256'])
+        writer.writerow(['dest_path', 'sha256'])
         for dest_rel, reason, sha in missing_rows.keys():
-            writer.writerow([dest_rel, reason, sha])
+            writer.writerow([dest_rel, sha])
 except Exception:
     pass
 PY
