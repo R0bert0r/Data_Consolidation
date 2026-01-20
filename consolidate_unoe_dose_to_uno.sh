@@ -35,6 +35,7 @@ Phases:
 
 Options:
   --dry-run           Run rsync in dry-run mode; destructive phases are skipped.
+  --self-test         Run lightweight CSV and bash syntax checks; no mounts required.
   --phase <name>      Run a specific phase.
   --run-id <id>       Override run ID (default: YYYY-MM-DD_HHMMSS).
   --log-dir <dir>     Override log directory (default under UNO).
@@ -77,7 +78,7 @@ log_status() {
   echo "[${SCRIPT_NAME}] ${1} (logs: ${LOGDIR})"
 }
 
-csv_escape() {
+csv_quote() {
   local value="${1}"
   local escaped="${value//\"/\"\"}"
   if [[ "${escaped}" == *","* || "${escaped}" == *"\""* || "${escaped}" == *$'\n'* || "${escaped}" =~ ^[[:space:]] || "${escaped}" =~ [[:space:]]$ ]]; then
@@ -87,7 +88,7 @@ csv_escape() {
   fi
 }
 
-append_csv_row() {
+csv_row() {
   local file="${1}"
   shift
   local first=true
@@ -99,7 +100,7 @@ append_csv_row() {
       else
         printf ','
       fi
-      csv_escape "${field}"
+      csv_quote "${field}"
     done
     printf '\n'
   } >> "${file}"
@@ -209,8 +210,8 @@ normalize_permissions() {
     if [[ -d "${scope}" ]]; then
       chown -R tom:sambashare "${scope}"
       find "${scope}" -type d -exec chmod 2775 {} +
-      find "${scope}" -type f -perm /111 -exec chmod 775 {} +
-      find "${scope}" -type f ! -perm /111 -exec chmod 664 {} +
+      find "${scope}" -type f -exec chmod g+rw {} +
+      find "${scope}" -type f -perm /111 -exec chmod g+x {} +
     fi
   done
 }
@@ -416,6 +417,15 @@ get_create_time() {
   local value
   local parsed
 
+  local birth
+  birth="$(stat -c %W "${file}" 2>/dev/null || echo 0)"
+  if [[ "${birth}" =~ ^[0-9]+$ && "${birth}" -gt 0 ]]; then
+    if parsed="$(date -u -d "@${birth}" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)"; then
+      echo "${parsed}|ok"
+      return 0
+    fi
+  fi
+
   if value="$(getfattr -n system.ntfs_crtime_be -e hex --only-values "${file}" 2>/dev/null)"; then
     value="${value//[[:space:]]/}"
     value="${value#0x}"
@@ -493,7 +503,7 @@ append_provenance() {
   local size="${7}"
   local sha="${8}"
 
-  append_csv_row "${provenance_file}" "${dest_rel}" "${origin}" "${src_path}" "${create_time}" "${create_status}" "${src_mtime}" "${size}" "${sha}"
+  csv_row "${provenance_file}" "${dest_rel}" "${origin}" "${src_path}" "${create_time}" "${create_status}" "${src_mtime}" "${size}" "${sha}"
 }
 
 create_time_coverage() {
@@ -722,12 +732,12 @@ resolve_one_collision() {
     classification="identical"
     action="no_action"
     resulting_paths="${dest_file}"
-    append_csv_row "${collision_log_candidates}" "${dest_file}" "${classification}" "${action}" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" "${resulting_paths}"
+    csv_row "${collision_log_candidates}" "${dest_file}" "${classification}" "${action}" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" "${resulting_paths}"
     return 0
   fi
 
   classification="conflict"
-  append_csv_row "${collision_log_candidates}" "${dest_file}" "${classification}" "pending" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" ""
+  csv_row "${collision_log_candidates}" "${dest_file}" "${classification}" "pending" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" ""
 
   local newest="UNOE"
   local unoe_epoch dose_epoch
@@ -791,7 +801,7 @@ resolve_one_collision() {
     resulting_paths="${dest_file};${suffixed}"
   fi
 
-  append_csv_row "${collision_log_resolution}" "${dest_file}" "${classification}" "${action}" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" "${resulting_paths}"
+  csv_row "${collision_log_resolution}" "${dest_file}" "${classification}" "${action}" "${unoe_file}" "${unoe_size}" "${unoe_mtime}" "${unoe_sha}" "${dose_file}" "${dose_size}" "${dose_mtime}" "${dose_sha}" "${resulting_paths}"
 
   if [[ "${DRY_RUN}" == "false" ]]; then
     local dest_rel
@@ -1094,6 +1104,27 @@ compute_create_time_manifest() {
     echo "ERROR: Provenance file missing/empty; run provenance phase first." >&2
     exit 1
   fi
+  python3 - "${provenance_file}" <<'PY'
+import csv
+import sys
+
+path = sys.argv[1]
+required = {
+    'dest_path',
+    'source_origin',
+    'source_path',
+    'src_create_time_utc',
+    'create_time_status',
+    'src_mtime_utc',
+    'size_bytes',
+    'sha256',
+}
+with open(path, newline='') as handle:
+    reader = csv.DictReader(handle)
+    header = reader.fieldnames or []
+    if not required.issubset(set(header)):
+        raise SystemExit("ERROR: Provenance file missing required headers.")
+PY
 
   local manifest="${LOGDIR}/50_create_time_manifest.csv"
   local missing="${LOGDIR}/50_create_time_missing.csv"
@@ -1110,9 +1141,8 @@ manifest = sys.argv[2]
 missing = sys.argv[3]
 uno_root = sys.argv[4]
 
-inode_groups = defaultdict(list)
-sha_groups = defaultdict(list)
-create_times = defaultdict(list)
+sha_to_times = defaultdict(list)
+sha_to_paths = defaultdict(list)
 all_entries = []
 
 
@@ -1122,11 +1152,6 @@ def normalize_dest(path):
     if path.startswith('/'):
         return path
     return os.path.join(uno_root, path)
-
-
-def record_create_time(group_key, ctime):
-    if group_key and ctime:
-        create_times[group_key].append(ctime)
 
 
 try:
@@ -1139,30 +1164,16 @@ try:
             status = (row.get('create_time_status') or '').strip()
             dest_abs = normalize_dest(dest_rel)
             all_entries.append((dest_rel, dest_abs, sha))
-
-            inode_key = ""
-            try:
-                if dest_abs and os.path.isfile(dest_abs):
-                    stat_info = os.stat(dest_abs)
-                    inode_key = (stat_info.st_dev, stat_info.st_ino)
-            except Exception:
-                inode_key = ""
-
-            if inode_key:
-                inode_groups[inode_key].append(dest_rel)
-                if status == 'ok' and ctime:
-                    record_create_time(inode_key, ctime)
-            elif sha:
-                sha_key = ("sha", sha)
-                sha_groups[sha_key].append(dest_rel)
-                if status == 'ok' and ctime:
-                    record_create_time(sha_key, ctime)
+            if sha and dest_rel:
+                sha_to_paths[sha].append(dest_rel)
+            if sha and ctime and status == 'ok':
+                sha_to_times[sha].append(ctime)
 except Exception:
     pass
 
 manifest_paths = {}
-for group_key, paths in {**inode_groups, **sha_groups}.items():
-    times = create_times.get(group_key, [])
+for sha, paths in sha_to_paths.items():
+    times = sha_to_times.get(sha, [])
     if not times:
         continue
     earliest = sorted(times)[0]
@@ -1226,7 +1237,7 @@ post_verify() {
         size="$(size_bytes "${file}")"
         local rel_path
         rel_path="${file#${UNO_ROOT}/}"
-        append_csv_row "${output_file}" "${rel_path}" "${sha}" "${size}"
+        csv_row "${output_file}" "${rel_path}" "${sha}" "${size}"
       fi
     done < "${hash_sample_file}"
   fi
@@ -1248,10 +1259,10 @@ self_test() {
   local provenance_csv="${temp_dir}/provenance.csv"
 
   echo "dest_path,classification,chosen_action,unoe_path,unoe_size,unoe_mtime_utc,unoe_sha256,dose_path,dose_size,dose_mtime_utc,dose_sha256,resulting_paths" > "${collision_csv}"
-  append_csv_row "${collision_csv}" "path with spaces,comma\"quote" "conflict" "keep_both" "/src/path,one" "123" "2024-01-01T00:00:00Z" "sha1" "/src/path two" "456" "2024-01-02T00:00:00Z" "sha2" "result,path"
+  csv_row "${collision_csv}" "path with spaces,comma\"quote" "conflict" "keep_both" "/src/path,one" "123" "2024-01-01T00:00:00Z" "sha1" "/src/path two" "456" "2024-01-02T00:00:00Z" "sha2" "result,path"
 
   echo "dest_path,source_origin,source_path,src_create_time_utc,create_time_status,src_mtime_utc,size_bytes,sha256" > "${provenance_csv}"
-  append_csv_row "${provenance_csv}" "dest,with,comma\"quote" "UNOE" "/src/path with spaces" "2024-01-01T00:00:00Z" "ok" "2024-01-02T00:00:00Z" "123" "sha256value"
+  csv_row "${provenance_csv}" "dest,with,comma\"quote" "UNOE" "/src/path with spaces" "2024-01-01T00:00:00Z" "ok" "2024-01-02T00:00:00Z" "123" "sha256value"
 
   python3 - "${collision_csv}" "${provenance_csv}" <<'PY'
 import csv
