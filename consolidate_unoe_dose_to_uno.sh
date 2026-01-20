@@ -417,6 +417,7 @@ get_create_time() {
   local file="${1}"
   local value
   local parsed
+  local endian
 
   local birth
   birth="$(stat -c %W "${file}" 2>/dev/null || echo 0)"
@@ -434,13 +435,23 @@ get_create_time() {
       if (( ${#value} > 16 )); then
         value="${value: -16}"
       fi
-      if parsed="$(python3 - "${value}" <<'PY'
+      endian="big"
+      if parsed="$(python3 - "${value}" "${endian}" <<'PY'
 import sys
 value = sys.argv[1].strip()
+endian = sys.argv[2].strip().lower()
 try:
     if len(value) < 16:
         raise ValueError("short")
-    filetime = int(value, 16)
+    raw = bytes.fromhex(value)
+    if len(raw) != 8:
+        raise ValueError("length")
+    if endian == "big":
+        filetime = int.from_bytes(raw, "big")
+    elif endian == "little":
+        filetime = int.from_bytes(raw, "little")
+    else:
+        raise ValueError("endian")
     unix = (filetime / 10_000_000) - 11644473600
     if unix < 0:
         raise ValueError("negative")
@@ -466,13 +477,23 @@ PY
       if (( ${#value} > 16 )); then
         value="${value: -16}"
       fi
-      if parsed="$(python3 - "${value}" <<'PY'
+      endian="little"
+      if parsed="$(python3 - "${value}" "${endian}" <<'PY'
 import sys
 value = sys.argv[1].strip()
+endian = sys.argv[2].strip().lower()
 try:
     if len(value) < 16:
         raise ValueError("short")
-    filetime = int(value, 16)
+    raw = bytes.fromhex(value)
+    if len(raw) != 8:
+        raise ValueError("length")
+    if endian == "big":
+        filetime = int.from_bytes(raw, "big")
+    elif endian == "little":
+        filetime = int.from_bytes(raw, "little")
+    else:
+        raise ValueError("endian")
     unix = (filetime / 10_000_000) - 11644473600
     if unix < 0:
         raise ValueError("negative")
@@ -1114,6 +1135,15 @@ compute_create_time_manifest() {
     return 0
   fi
 
+  if [[ -z "${LOGDIR:-}" ]]; then
+    echo "ERROR: LOGDIR is not set; initialize run before computing manifest." >&2
+    exit 1
+  fi
+  if [[ -z "${UNO_ROOT:-}" ]]; then
+    echo "ERROR: UNO_ROOT is not set; cannot compute manifest." >&2
+    exit 1
+  fi
+
   init_provenance
   if [[ ! -s "${provenance_file}" || "$(wc -l < "${provenance_file}")" -le 1 ]]; then
     echo "ERROR: Provenance file missing/empty; run provenance phase first." >&2
@@ -1169,22 +1199,19 @@ def normalize_dest(path):
     return os.path.join(uno_root, path)
 
 
-try:
-    with open(provenance, newline='') as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            dest_rel = (row.get('dest_path') or '').strip()
-            sha = (row.get('sha256') or '').strip()
-            ctime = (row.get('src_create_time_utc') or '').strip()
-            status = (row.get('create_time_status') or '').strip()
-            dest_abs = normalize_dest(dest_rel)
-            all_entries.append((dest_rel, dest_abs, sha))
-            if sha and dest_rel:
-                sha_to_paths[sha].append(dest_rel)
-            if sha and ctime and status == 'ok':
-                sha_to_times[sha].append(ctime)
-except Exception:
-    pass
+with open(provenance, newline='') as handle:
+    reader = csv.DictReader(handle)
+    for row in reader:
+        dest_rel = (row.get('dest_path') or '').strip()
+        sha = (row.get('sha256') or '').strip()
+        ctime = (row.get('src_create_time_utc') or '').strip()
+        status = (row.get('create_time_status') or '').strip()
+        dest_abs = normalize_dest(dest_rel)
+        all_entries.append((dest_rel, dest_abs, sha))
+        if sha and dest_rel:
+            sha_to_paths[sha].append(dest_rel)
+        if sha and ctime and status == 'ok':
+            sha_to_times[sha].append(ctime)
 
 manifest_paths = {}
 for sha, paths in sha_to_paths.items():
@@ -1195,16 +1222,13 @@ for sha, paths in sha_to_paths.items():
     for path in paths:
         manifest_paths[path] = earliest
 
-try:
-    with open(manifest, 'w', newline='') as handle:
-        writer = csv.writer(handle)
-        writer.writerow(['dest_path_relative_to_share', 'earliest_create_time_utc_iso8601'])
-        for path, earliest in manifest_paths.items():
-            writer.writerow([path, earliest])
-except Exception:
-    pass
+with open(manifest, 'w', newline='') as handle:
+    writer = csv.writer(handle)
+    writer.writerow(['dest_path_relative_to_share', 'earliest_create_time_utc_iso8601'])
+    for path in sorted(manifest_paths):
+        writer.writerow([path, manifest_paths[path]])
 
-missing_rows = {}
+missing_rows = []
 for dest_rel, dest_abs, sha in all_entries:
     if not dest_rel:
         continue
@@ -1216,17 +1240,18 @@ for dest_rel, dest_abs, sha in all_entries:
         reason = "missing_identity_key"
     else:
         reason = "missing_creation_time"
-    missing_rows[(dest_rel, reason, sha)] = None
+    missing_rows.append((dest_rel, reason, sha))
 
-try:
-    with open(missing, 'w', newline='') as handle:
-        writer = csv.writer(handle)
-        writer.writerow(['dest_path', 'sha256'])
-        for dest_rel, reason, sha in missing_rows.keys():
-            writer.writerow([dest_rel, sha])
-except Exception:
-    pass
+with open(missing, 'w', newline='') as handle:
+    writer = csv.writer(handle)
+    writer.writerow(['dest_path', 'reason', 'sha256'])
+    for dest_rel, reason, sha in sorted(missing_rows):
+        writer.writerow([dest_rel, reason, sha])
 PY
+  if [[ $? -ne 0 ]]; then
+    echo "ERROR: Failed to write create time manifest outputs." >&2
+    exit 1
+  fi
 
   cat <<EOWIN > "${instructions}"
 Apply creation times from Windows after copy completes.
@@ -1267,8 +1292,17 @@ self_test() {
   bash -n "${script_path}"
 
   local temp_dir
-  temp_dir="$(mktemp -d)"
-  trap '[[ -n "${temp_dir:-}" ]] && rm -rf "${temp_dir}"' EXIT
+  local cleanup_self_test="true"
+  if [[ -n "${SELF_TEST_DIR:-}" ]]; then
+    temp_dir="${SELF_TEST_DIR}"
+    mkdir -p "${temp_dir}"
+    cleanup_self_test="false"
+  else
+    temp_dir="$(mktemp -d)"
+  fi
+  if [[ "${cleanup_self_test}" == "true" ]]; then
+    trap '[[ -n "${temp_dir:-}" ]] && rm -rf "${temp_dir}"' EXIT
+  fi
 
   local collision_csv="${temp_dir}/collision.csv"
   local provenance_csv="${temp_dir}/provenance.csv"
@@ -1304,6 +1338,31 @@ with open(provenance, newline='') as handle:
         raise SystemExit(1)
     if "comma\"quote" not in row['dest_path']:
         raise SystemExit(1)
+PY
+
+  python3 - <<'PY'
+import datetime
+import sys
+
+def filetime_to_iso(hex_value, endian):
+    raw = bytes.fromhex(hex_value)
+    if len(raw) != 8:
+        raise SystemExit(1)
+    filetime = int.from_bytes(raw, endian)
+    unix = (filetime / 10_000_000) - 11644473600
+    if unix < 0:
+        raise SystemExit(1)
+    dt = datetime.datetime.fromtimestamp(unix, tz=datetime.timezone.utc)
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+expected = "2020-01-01T00:00:00Z"
+big_hex = "01d5c03669050000"
+little_hex = "0000056936c0d501"
+
+if filetime_to_iso(big_hex, "big") != expected:
+    raise SystemExit(1)
+if filetime_to_iso(little_hex, "little") != expected:
+    raise SystemExit(1)
 PY
 }
 
