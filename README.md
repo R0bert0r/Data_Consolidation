@@ -163,3 +163,16 @@ After applying creation times:
 - **No writes to sources** occur (UNOE/DOSE are only read for file content and metadata). The workflow reads metadata and file contents for hashing and comparison.
 - **Access times (atime) may change** due to reads.
 - **Creation times (ctime) cannot be preserved** on Linux because `ctime` is inode change time, not Windows creation time. The Windows apply step restores creation timestamps using the manifest.
+# Data Consolidation
+
+## Smoke Test
+
+Run the lightweight checks (no NAS mounts required):
+
+```bash
+./smoke.sh
+```
+
+This validates:
+- Bash syntax for `consolidate_unoe_dose_to_uno.sh`
+- CSV parsing with paths containing spaces, commas, and quotes
