@@ -21,6 +21,11 @@ trap 'rm -rf "${TEMP_DIR}"' EXIT
 
 bash -n "${SCRIPT_PATH}"
 bash -n "${SCRIPT_DIR}/smoke.sh"
+if [[ -n "${REPO_ROOT}" && -f "${REPO_ROOT}/tests/smoke.sh" ]]; then
+  bash -n "${REPO_ROOT}/tests/smoke.sh"
+elif [[ -f "${SCRIPT_DIR}/tests/smoke.sh" ]]; then
+  bash -n "${SCRIPT_DIR}/tests/smoke.sh"
+fi
 SELF_TEST_DIR="${TEMP_DIR}" bash "${SCRIPT_PATH}" --self-test
 
 python3 - "${TEMP_DIR}" <<'PY'
