@@ -88,22 +88,14 @@ csv_quote() {
   fi
 }
 
-csv_row() {
-  local file="${1}"
+csv_append_row() {
+  local csv_path="${1}"
   shift
-  local first=true
-  local field
-  {
-    for field in "$@"; do
-      if [[ "${first}" == "true" ]]; then
-        first=false
-      else
-        printf ','
-      fi
-      csv_quote "${field}"
-    done
-    printf '\n'
-  } >> "${file}"
+  printf '%s\0' "$@" | python3 -c $'import csv,sys\ncsv_path=sys.argv[1]\ndata=sys.stdin.buffer.read().split(b"\\0")\nif data and data[-1]==b"":\n    data=data[:-1]\nrow=[x.decode("utf-8", errors="surrogateescape") for x in data]\nwith open(csv_path, "a", newline="") as handle:\n    csv.writer(handle).writerow(row)\n' "${csv_path}"
+}
+
+csv_row() {
+  csv_append_row "$@"
 }
 
 is_excluded_dir_name() {
@@ -129,9 +121,7 @@ find_top_level_files() {
 rsync_excludes() {
   RSYNC_EXCLUDES=(
     '--exclude=$RECYCLE.BIN/'
-    '--exclude=$RECYCLE.BIN/***'
     '--exclude=System Volume Information/'
-    '--exclude=System Volume Information/***'
   )
 }
 
@@ -344,9 +334,9 @@ copy_mapped_and_unmapped() {
       continue
     fi
 
-    if [[ -n "${MAP[${name}]:-}" ]]; then
-      run_rsync "${entry}/" "${UNO_ROOT}/${MAP[${name}]}/" extra_flags "${log_file}"
-      verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/${MAP[${name}]}/" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_${name}_${origin}.txt"
+    if [[ -n "${MAP["$name"]+x}" ]]; then
+      run_rsync "${entry}/" "${UNO_ROOT}/${MAP["$name"]}/" extra_flags "${log_file}"
+      verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/${MAP["$name"]}/" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_${name}_${origin}.txt"
     else
       run_rsync "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/${origin}/${name}/" extra_flags "${log_file}"
       verify_rsync_dryrun "${entry}/" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/${origin}/${name}/" extra_flags "${LOGDIR}/${verify_prefix}_verify_dryrun_unmapped_${name}_${origin}.txt"
@@ -440,9 +430,11 @@ get_create_time() {
     attr_present=true
     if parsed="$(python3 - "${value}" "${mode}" <<'PY'
 import sys
+from datetime import datetime, timezone, timedelta
 
-value = sys.argv[1].strip()
+value = sys.argv[1]
 mode = sys.argv[2].strip().lower()
+value = ''.join(value.split())
 if value.startswith(("0x", "0X")):
     value = value[2:]
 if len(value) != 16:
@@ -455,19 +447,34 @@ if len(raw) != 8:
     raise SystemExit(1)
 
 if mode == "big":
-    endian = "big"
+    preferred = "big"
 elif mode == "native":
-    endian = sys.byteorder
+    preferred = sys.byteorder
 else:
     raise SystemExit(1)
 
-filetime = int.from_bytes(raw, endian)
-unix = (filetime // 10_000_000) - 11644473600
-if unix < 0:
-    raise SystemExit(1)
-from datetime import datetime, timezone
-dt = datetime.fromtimestamp(unix, tz=timezone.utc)
-print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
+ordered = [preferred, "little" if preferred == "big" else "big"]
+now = datetime.now(timezone.utc)
+min_dt = datetime(1980, 1, 1, tzinfo=timezone.utc)
+max_dt = now + timedelta(days=1)
+
+def decode(endian):
+    filetime = int.from_bytes(raw, endian)
+    unix = (filetime // 10_000_000) - 11644473600
+    if unix < 0:
+        return None
+    dt = datetime.fromtimestamp(unix, tz=timezone.utc)
+    return dt
+
+for endian in ordered:
+    dt = decode(endian)
+    if dt is None:
+        continue
+    if min_dt <= dt <= max_dt:
+        print(dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
+        raise SystemExit(0)
+
+raise SystemExit(1)
 PY
 2>/dev/null)"; then
       echo "${parsed}|ok"
@@ -487,7 +494,8 @@ provenance_file=""
 init_provenance() {
   provenance_file="${LOGDIR}/33_dest_provenance.csv"
   if [[ ! -f "${provenance_file}" ]]; then
-    echo "dest_path,source_origin,source_path,src_create_time_utc,create_time_status,src_mtime_utc,size_bytes,sha256" > "${provenance_file}"
+    : > "${provenance_file}"
+    csv_append_row "${provenance_file}" "dest_path" "source_origin" "source_path" "src_create_time_utc" "create_time_status" "src_mtime_utc" "size_bytes" "sha256"
   fi
 }
 
@@ -628,8 +636,8 @@ record_provenance_all() {
   record_provenance_for_bucket "${DOSE_ROOT}/Dropbox" "${UNO_ROOT}/Dropbox" "DOSE"
 
   for key in "${!MAP[@]}"; do
-    record_provenance_for_bucket "${UNOE_ROOT}/${key}" "${UNO_ROOT}/${MAP[${key}]}" "UNOE"
-    record_provenance_for_bucket "${DOSE_ROOT}/${key}" "${UNO_ROOT}/${MAP[${key}]}" "DOSE"
+    record_provenance_for_bucket "${UNOE_ROOT}/${key}" "${UNO_ROOT}/${MAP["$key"]}" "UNOE"
+    record_provenance_for_bucket "${DOSE_ROOT}/${key}" "${UNO_ROOT}/${MAP["$key"]}" "DOSE"
   done
 
   while IFS= read -r -d '' entry; do
@@ -638,7 +646,7 @@ record_provenance_all() {
     if is_excluded_dir_name "${name}"; then
       continue
     fi
-    if [[ -z "${MAP[${name}]:-}" && "${name}" != "ASH" && "${name}" != "Backups" && "${name}" != "Dropbox" && "${name}" != "found.000" ]]; then
+    if [[ -z "${MAP["$name"]+x}" && "${name}" != "ASH" && "${name}" != "Backups" && "${name}" != "Dropbox" && "${name}" != "found.000" ]]; then
       record_provenance_for_bucket "${entry}" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/UNOE/${name}" "UNOE"
     fi
   done < <(find "${UNOE_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0)
@@ -649,7 +657,7 @@ record_provenance_all() {
     if is_excluded_dir_name "${name}"; then
       continue
     fi
-    if [[ -z "${MAP[${name}]:-}" && "${name}" != "ASH" && "${name}" != "Backups" && "${name}" != "Dropbox" && "${name}" != "found.000" ]]; then
+    if [[ -z "${MAP["$name"]+x}" && "${name}" != "ASH" && "${name}" != "Backups" && "${name}" != "Dropbox" && "${name}" != "found.000" ]]; then
       record_provenance_for_bucket "${entry}" "${UNO_ROOT}/90_System_Artifacts/Unmapped_Folders/DOSE/${name}" "DOSE"
     fi
   done < <(find "${DOSE_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0)
@@ -669,10 +677,12 @@ init_collision_logs() {
   collision_log_resolution="${LOGDIR}/31_conflict_resolution.csv"
   collision_log_actions="${LOGDIR}/32_conflict_actions.log"
   if [[ ! -f "${collision_log_candidates}" ]]; then
-    echo "dest_path,classification,chosen_action,unoe_path,unoe_size,unoe_mtime_utc,unoe_sha256,dose_path,dose_size,dose_mtime_utc,dose_sha256,resulting_paths" > "${collision_log_candidates}"
+    : > "${collision_log_candidates}"
+    csv_append_row "${collision_log_candidates}" "dest_path" "classification" "chosen_action" "unoe_path" "unoe_size" "unoe_mtime_utc" "unoe_sha256" "dose_path" "dose_size" "dose_mtime_utc" "dose_sha256" "resulting_paths"
   fi
   if [[ ! -f "${collision_log_resolution}" ]]; then
-    echo "dest_path,classification,chosen_action,unoe_path,unoe_size,unoe_mtime_utc,unoe_sha256,dose_path,dose_size,dose_mtime_utc,dose_sha256,resulting_paths" > "${collision_log_resolution}"
+    : > "${collision_log_resolution}"
+    csv_append_row "${collision_log_resolution}" "dest_path" "classification" "chosen_action" "unoe_path" "unoe_size" "unoe_mtime_utc" "unoe_sha256" "dose_path" "dose_size" "dose_mtime_utc" "dose_sha256" "resulting_paths"
   fi
   : > "${collision_log_actions}"
 }
@@ -886,7 +896,7 @@ resolve_conflicts() {
 
   for key in "${!MAP[@]}"; do
     local dest_rel
-    dest_rel="${MAP[${key}]}"
+    dest_rel="${MAP["$key"]}"
     resolve_conflicts_in_bucket "${UNOE_ROOT}/${key}" "${DOSE_ROOT}/${key}" "${UNO_ROOT}/${dest_rel}"
   done
 
@@ -922,17 +932,30 @@ compute_hash_sample() {
     "${UNO_ROOT}/Research"
   )
 
-  if [[ -f "${collision_log_resolution}" ]]; then
-    python3 - "${UNO_ROOT}" "${collision_log_resolution}" >> "${hash_sample_file}" <<'PY'
+  python3 - "${RUN_ID}" "${UNO_ROOT}" "${hash_sample_file}" "${collision_log_resolution}" "${buckets[@]}" <<'PY'
 import csv
 import os
+import random
 import sys
 
-uno_root = sys.argv[1]
-csv_path = sys.argv[2]
+seed = sys.argv[1]
+uno_root = sys.argv[2]
+list_path = sys.argv[3]
+collision_log = sys.argv[4]
+buckets = sys.argv[5:]
 
-try:
-    with open(csv_path, newline='') as handle:
+rng = random.Random(seed)
+paths = []
+
+def add_path(path):
+    if path and path not in seen:
+        seen.add(path)
+        paths.append(path)
+
+seen = set()
+
+if collision_log and os.path.isfile(collision_log):
+    with open(collision_log, newline='') as handle:
         reader = csv.reader(handle)
         next(reader, None)
         for row in reader:
@@ -942,28 +965,14 @@ try:
             if not path:
                 continue
             if path.startswith('/'):
-                print(path)
+                add_path(path)
             else:
-                print(os.path.join(uno_root, path))
-except Exception:
-    pass
-PY
-  fi
+                add_path(os.path.join(uno_root, path))
 
-  for bucket in "${buckets[@]}"; do
-    if [[ -d "${bucket}" ]]; then
-      python3 - "${RUN_ID}" "${bucket}" >> "${hash_sample_file}" <<'PY'
-import os
-import random
-import sys
-
-seed = sys.argv[1]
-bucket = sys.argv[2]
-
-rng = random.Random(f"{seed}|{bucket}")
-files = []
-
-try:
+for bucket in buckets:
+    if not os.path.isdir(bucket):
+        continue
+    files = []
     for root, dirnames, filenames in os.walk(bucket):
         dirnames[:] = [d for d in dirnames if d not in ('$RECYCLE.BIN', 'System Volume Information')]
         for name in filenames:
@@ -974,51 +983,22 @@ try:
                     files.append((size, path))
             except Exception:
                 continue
-except Exception:
-    files = []
-
-if not files:
-    sys.exit(0)
-
-files.sort(key=lambda item: item[0], reverse=True)
-top_paths = [path for _, path in files[:50]]
-all_paths = [path for _, path in files]
-
-if len(all_paths) <= 200:
-    sample_paths = list(all_paths)
-else:
-    sample_paths = rng.sample(all_paths, 200)
-
-seen = set()
-for path in top_paths + sample_paths:
-    if path in seen:
+    if not files:
         continue
-    seen.add(path)
-    print(path)
+    files.sort(key=lambda item: item[0], reverse=True)
+    top_paths = [path for _, path in files[:50]]
+    all_paths = [path for _, path in files]
+    if len(all_paths) <= 200:
+        sample_paths = list(all_paths)
+    else:
+        sample_paths = rng.sample(all_paths, 200)
+    for path in top_paths + sample_paths:
+        add_path(path)
+
+with open(list_path, 'w', encoding='utf-8') as handle:
+    for path in paths:
+        handle.write(f"{path}\n")
 PY
-    fi
-  done
-
-  python3 - "${hash_sample_file}" <<'PY' > "${hash_sample_file}.tmp"
-import sys
-
-src = sys.argv[1]
-seen = set()
-
-try:
-    with open(src, 'r', encoding='utf-8', errors='replace') as handle:
-        for line in handle:
-            path = line.strip('\n')
-            if not path:
-                continue
-            if path in seen:
-                continue
-            seen.add(path)
-            print(path)
-except Exception:
-    pass
-PY
-  mv "${hash_sample_file}.tmp" "${hash_sample_file}"
 
   python3 - "${hash_sample_file}" "${output_file}" "${UNO_ROOT}" <<'PY'
 import csv
@@ -1030,36 +1010,28 @@ sample_list = sys.argv[1]
 output_csv = sys.argv[2]
 uno_root = sys.argv[3]
 
-try:
-    with open(output_csv, 'w', newline='') as handle:
-        writer = csv.writer(handle)
-        writer.writerow(['path', 'sha256', 'size_bytes'])
-        try:
-            sample_handle = open(sample_list, 'r', encoding='utf-8', errors='replace')
-        except Exception:
-            sample_handle = None
-        if sample_handle:
-            with sample_handle:
-                for line in sample_handle:
-                    path = line.strip('\n')
-                    if not path or not os.path.isfile(path):
-                        continue
-                    try:
-                        size = os.path.getsize(path)
-                    except Exception:
-                        continue
-                    rel_path = path[len(uno_root) + 1:] if path.startswith(uno_root + os.sep) else path
-                    try:
-                        sha256 = hashlib.sha256()
-                        with open(path, 'rb') as data_handle:
-                            for chunk in iter(lambda: data_handle.read(1024 * 1024), b''):
-                                sha256.update(chunk)
-                        digest = sha256.hexdigest()
-                    except Exception:
-                        continue
-                    writer.writerow([rel_path, digest, size])
-except Exception:
-    pass
+with open(output_csv, 'w', newline='') as handle:
+    writer = csv.writer(handle)
+    writer.writerow(['path', 'sha256', 'size_bytes'])
+    with open(sample_list, 'r', encoding='utf-8', errors='replace') as sample_handle:
+        for line in sample_handle:
+            path = line.strip('\n')
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                continue
+            rel_path = path[len(uno_root) + 1:] if path.startswith(uno_root + os.sep) else path
+            try:
+                sha256 = hashlib.sha256()
+                with open(path, 'rb') as data_handle:
+                    for chunk in iter(lambda: data_handle.read(1024 * 1024), b''):
+                        sha256.update(chunk)
+                digest = sha256.hexdigest()
+            except Exception:
+                continue
+            writer.writerow([rel_path, digest, size])
 PY
 }
 
@@ -1106,11 +1078,6 @@ compute_create_time_manifest() {
     echo "ERROR: LOGDIR is not set; initialize run before computing manifest." >&2
     exit 1
   fi
-  if [[ -z "${UNO_ROOT:-}" ]]; then
-    echo "ERROR: UNO_ROOT is not set; cannot compute manifest." >&2
-    exit 1
-  fi
-
   init_provenance
   if [[ ! -s "${provenance_file}" || "$(wc -l < "${provenance_file}")" -le 1 ]]; then
     echo "ERROR: Provenance file missing/empty; run provenance phase first." >&2
@@ -1142,28 +1109,18 @@ PY
   local missing="${LOGDIR}/50_create_time_missing.csv"
   local instructions="${LOGDIR}/51_create_time_windows_apply_instructions.txt"
 
-  python3 - "${provenance_file}" "${manifest}" "${missing}" "${UNO_ROOT}" <<'PY'
+  python3 - "${provenance_file}" "${manifest}" "${missing}" <<'PY'
 import csv
-import os
 import sys
 from collections import defaultdict
 
 provenance = sys.argv[1]
 manifest = sys.argv[2]
 missing = sys.argv[3]
-uno_root = sys.argv[4]
 
 sha_to_times = defaultdict(list)
 sha_to_paths = defaultdict(list)
 all_entries = []
-
-
-def normalize_dest(path):
-    if not path:
-        return ""
-    if path.startswith('/'):
-        return path
-    return os.path.join(uno_root, path)
 
 
 with open(provenance, newline='') as handle:
@@ -1173,8 +1130,7 @@ with open(provenance, newline='') as handle:
         sha = (row.get('sha256') or '').strip()
         ctime = (row.get('src_create_time_utc') or '').strip()
         status = (row.get('create_time_status') or '').strip()
-        dest_abs = normalize_dest(dest_rel)
-        all_entries.append((dest_rel, dest_abs, sha))
+        all_entries.append((dest_rel, sha))
         if sha and dest_rel:
             sha_to_paths[sha].append(dest_rel)
         if sha and ctime and status == 'ok':
@@ -1196,14 +1152,12 @@ with open(manifest, 'w', newline='') as handle:
         writer.writerow([path, manifest_paths[path]])
 
 missing_rows = []
-for dest_rel, dest_abs, sha in all_entries:
+for dest_rel, sha in all_entries:
     if not dest_rel:
         continue
     if dest_rel in manifest_paths:
         continue
-    if not dest_abs or not os.path.exists(dest_abs):
-        reason = "destination_missing"
-    elif not sha:
+    if not sha:
         reason = "missing_identity_key"
     else:
         reason = "missing_creation_time"
@@ -1274,11 +1228,13 @@ self_test() {
   local collision_csv="${temp_dir}/collision.csv"
   local provenance_csv="${temp_dir}/provenance.csv"
 
-  echo "dest_path,classification,chosen_action,unoe_path,unoe_size,unoe_mtime_utc,unoe_sha256,dose_path,dose_size,dose_mtime_utc,dose_sha256,resulting_paths" > "${collision_csv}"
-  csv_row "${collision_csv}" "path with spaces,comma\"quote" "conflict" "keep_both" "/src/path,one" "123" "2024-01-01T00:00:00Z" "sha1" "/src/path two" "456" "2024-01-02T00:00:00Z" "sha2" "result,path"
+  : > "${collision_csv}"
+  csv_append_row "${collision_csv}" "dest_path" "classification" "chosen_action" "unoe_path" "unoe_size" "unoe_mtime_utc" "unoe_sha256" "dose_path" "dose_size" "dose_mtime_utc" "dose_sha256" "resulting_paths"
+  csv_append_row "${collision_csv}" "path with spaces,comma\"quote" "conflict" "keep_both" "/src/path,one" "123" "2024-01-01T00:00:00Z" "sha1" "/src/path two" "456" "2024-01-02T00:00:00Z" "sha2" "result,path"
 
-  echo "dest_path,source_origin,source_path,src_create_time_utc,create_time_status,src_mtime_utc,size_bytes,sha256" > "${provenance_csv}"
-  csv_row "${provenance_csv}" "dest,with,comma\"quote" "UNOE" "/src/path with spaces" "2024-01-01T00:00:00Z" "ok" "2024-01-02T00:00:00Z" "123" "sha256value"
+  : > "${provenance_csv}"
+  csv_append_row "${provenance_csv}" "dest_path" "source_origin" "source_path" "src_create_time_utc" "create_time_status" "src_mtime_utc" "size_bytes" "sha256"
+  csv_append_row "${provenance_csv}" "dest,with,comma\"quote" "UNOE" "/src/path with spaces" "2024-01-01T00:00:00Z" "ok" "2024-01-02T00:00:00Z" "123" "sha256value"
 
   python3 - "${collision_csv}" "${provenance_csv}" <<'PY'
 import csv
